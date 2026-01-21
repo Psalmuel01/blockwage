@@ -1,0 +1,68 @@
+{
+  "name": "blockwage-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BlockWage frontend (Next.js + TypeScript + Tailwind) — employer dashboard, employee claim pages (x402) and facilitator demo integration",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint",
+    "format": "prettier --write .",
+    "typecheck": "tsc --noEmit",
+    "prepare": "husky install",
+    "export": "next export"
+  },
+  "dependencies": {
+    "next": "^13.4.12",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "ethers": "^6.8.0",
+    "axios": "^1.4.0",
+    "clsx": "^1.2.1",
+    "swr": "^2.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.1.6",
+    "tailwindcss": "^3.4.7",
+    "postcss": "^8.4.24",
+    "autoprefixer": "^10.4.14",
+    "eslint": "^8.45.0",
+    "eslint-config-next": "^13.4.12",
+    "prettier": "^2.8.8",
+    "husky": "^9.0.0",
+    "lint-staged": "^13.2.1",
+    "@types/node": "^20.4.2",
+    "@types/react": "^18.2.21",
+    "@types/react-dom": "^18.2.7",
+    "jest": "^29.6.0",
+    "ts-jest": "^29.1.0",
+    "@testing-library/react": "^14.0.0",
+    "@testing-library/jest-dom": "^6.0.0"
+  },
+  "lint-staged": {
+    "*.{js,ts,tsx,json,css,md}": [
+      "prettier --write"
+    ]
+  },
+  "husky": {
+    "hooks": {
+      "pre-commit": "lint-staged"
+    }
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "keywords": [
+    "cronos",
+    "x402",
+    "payroll",
+    "stablecoin",
+    "usdc",
+    "facilitator",
+    "nextjs",
+    "tailwind"
+  ],
+  "author": "BlockWage Team",
+  "license": "MIT"
+}

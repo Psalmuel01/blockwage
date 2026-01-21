@@ -30,12 +30,14 @@ pragma solidity ^0.8.17;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-abstract contract PaymentVerifier is Ownable {
+contract PaymentVerifier is Ownable {
     // mapping employee => periodId => verified
     mapping(address => mapping(uint256 => bool)) private _verified;
 
     // mapping of raw proof hash => bool (prevent submitting same raw proof multiple times)
     mapping(bytes32 => bool) private _proofSeen;
+
+    constructor() Ownable(msg.sender) {}
 
     event PaymentVerified(
         address indexed employee,

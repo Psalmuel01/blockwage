@@ -74,13 +74,13 @@ Employee HTTP Endpoint <-- x402 402 -- Scheduler/Facilitator --> Cronos Facilita
 ## Smart Contracts (where to find them)
 
 - `SalarySchedule` — handles cadence validation and emits `SalaryDue` events.
-  - File: `Vibe Coding/blockwage/contracts/SalarySchedule.sol#L1-300`
+  - File: `blockwage/hardhat/contracts/SalarySchedule.sol#L1-300`
 
 - `PayrollVault` — vault that accepts deposits, reserves funds on `SalaryDue`, and releases tokens after proof verification.
-  - File: `Vibe Coding/blockwage/contracts/PayrollVault.sol#L1-365`
+  - File: `blockwage/hardhat/contracts/PayrollVault.sol#L1-365`
 
 - `PaymentVerifier` — simple on-chain registry to record facilitator proofs and ensure no double payment.
-  - File: `Vibe Coding/blockwage/contracts/PaymentVerifier.sol#L1-200`
+  - File: `blockwage/hardhat/contracts/PaymentVerifier.sol#L1-200`
 
 These contracts use OpenZeppelin (Ownable, SafeERC20, ReentrancyGuard) and are written for Solidity `^0.8.17`.
 
@@ -98,7 +98,7 @@ Backend server provides the x402 endpoints:
     - `token`: stablecoin contract address (devUSDC.e)
     - `periodId`: identifier for the payroll period (timestamp or period code)
 
-  Implementation: `Vibe Coding/blockwage/backend/src/index.ts#L1-400`
+  Implementation: `blockwage/backend/src/index.ts#L1-400`
 
 - Verify endpoint
   - `POST /salary/verify`
@@ -110,7 +110,7 @@ Backend server provides the x402 endpoints:
     2. Call `PaymentVerifier.verifyPayment(facilitatorProof)` on-chain to mark proof consumed and prevent replay.
     3. Call `PayrollVault.releaseSalary(employee, periodId)` to transfer tokens to the employee.
 
-  Implementation: `Vibe Coding/blockwage/backend/src/index.ts#L1-400`
+  Implementation: `blockwage/backend/src/index.ts#L1-400`
 
 x402 explanation (short):
 - Employee's server returns a 402 response that contains payment parameters.
@@ -119,10 +119,10 @@ x402 explanation (short):
 - The payroll backend verifies the proof (off-chain SDK + on-chain `PaymentVerifier`), then finalizes the transfer on-chain.
 
 x402 sample body generation helper:
-- `Vibe Coding/blockwage/backend/src/x402.ts#L1-224`
+- `blockwage/backend/src/x402.ts#L1-224`
 
 Facilitator verifier stub:
-- `Vibe Coding/blockwage/backend/src/verifier.ts#L1-200`
+- `blockwage/backend/src/verifier.ts#L1-200`
 
 ---
 
@@ -136,7 +136,7 @@ The scheduler:
 - Includes retries/exponential backoff and persistence to avoid duplicate payouts.
 
 Scheduler implementation:
-- `Vibe Coding/blockwage/scheduler/src/index.ts#L1-400`
+- `blockwage/scheduler/src/index.ts#L1-400`
 
 Key features:
 - Configurable cron expression via `SCHED_CRON`.
@@ -153,8 +153,8 @@ This project is designed to integrate with `@crypto.com/facilitator-client`:
 - For local development, a fallback stub builds a compact `facilitatorProof` (ABI-packed `employee|periodId|amount`) — this is not secure and only for local testing.
 
 See:
-- Backend integration & usage: `Vibe Coding/blockwage/backend/src/index.ts#L1-400`
-- Scheduler wrapper: `Vibe Coding/blockwage/scheduler/src/index.ts#L1-400`
+- Backend integration & usage: `blockwage/backend/src/index.ts#L1-400`
+- Scheduler wrapper: `blockwage/scheduler/src/index.ts#L1-400`
 
 Important: In production, ensure facilitator proofs contain verifiable cryptographic attestations and that your backend / on-chain verifier validates them properly (or relies on a trusted oracle/attestation from the facilitator backend).
 
@@ -172,7 +172,7 @@ Prerequisites:
 
 ```/dev/null/commands.sh#L1-10
 # from repo root (where README.md lives)
-cd "Vibe Coding/blockwage"
+cd "blockwage"
 # Backend
 cd backend
 npm ci
@@ -229,14 +229,14 @@ Environment variables (example `.env`):
 - `FACILITATOR_ENDPOINT` — optional local facilitator emulator endpoint
 
 See `deploy/scripts/deploy.ts` for deployment guidance:
-- `Vibe Coding/blockwage/deploy/scripts/deploy.ts#L1-199`
+- `blockwage/deploy/scripts/deploy.ts#L1-199`
 
 ---
 
 ## Deployment (Hardhat → Cronos testnet)
 
 - Configure `hardhat.config.ts` for Cronos testnet RPC and private key:
-  - `Vibe Coding/blockwage/hardhat.config.ts#L1-200`
+  - `blockwage/hardhat.config.ts#L1-200`
 
 - Deploy contracts via Hardhat script:
   - `npx hardhat run --network cronos_testnet deploy/scripts/deploy.ts`
@@ -245,23 +245,6 @@ See `deploy/scripts/deploy.ts` for deployment guidance:
   - Deploy a devUSDC mock (if `STABLE_TOKEN` not provided).
   - Deploy `PaymentVerifier`, `SalarySchedule`, `PayrollVault`.
   - Wire contracts and optionally attempt explorer verification.
-
----
-
-## Tests
-
-- Smart contract tests: Hardhat / Mocha / Chai
-  - Tests exist under: `Vibe Coding/blockwage/test/contracts/payroll.test.js#L1-211`
-  - Run: `npx hardhat test`
-
-- Backend tests: Jest (in `backend` folder)
-  - Run: `cd backend && npm test`
-
-- Scheduler tests: Jest (in `scheduler` folder)
-  - Run: `cd scheduler && npm test`
-
-Note: CI config (GitHub Actions) runs contract tests, builds and tests backend/scheduler:
-- `Vibe Coding/blockwage/.github/workflows/ci.yml#L1-200`
 
 ---
 
@@ -286,46 +269,6 @@ Edge cases handled in tests:
 - Double payout attempt gets prevented.
 - Misaligned periods are rejected by `SalarySchedule`.
 - Release fails if insufficient funds in vault.
-
----
-
-## Files of Interest (quick map)
-
-- Contracts:
-  - `Vibe Coding/blockwage/contracts/SalarySchedule.sol#L1-300`
-  - `Vibe Coding/blockwage/contracts/PayrollVault.sol#L1-365`
-  - `Vibe Coding/blockwage/contracts/PaymentVerifier.sol#L1-200`
-
-- Backend:
-  - `Vibe Coding/blockwage/backend/src/index.ts#L1-400` — main HTTP server & API handlers
-  - `Vibe Coding/blockwage/backend/src/x402.ts#L1-224` — x402 helpers
-  - `Vibe Coding/blockwage/backend/src/verifier.ts#L1-200` — verifier stub
-  - `Vibe Coding/blockwage/backend/package.json#L1-200`
-
-- Scheduler:
-  - `Vibe Coding/blockwage/scheduler/src/index.ts#L1-400`
-  - `Vibe Coding/blockwage/scheduler/package.json#L1-200`
-
-- Deployment & CI:
-  - `Vibe Coding/blockwage/deploy/scripts/deploy.ts#L1-199`
-  - `Vibe Coding/blockwage/hardhat.config.ts#L1-200`
-  - `Vibe Coding/blockwage/.github/workflows/ci.yml#L1-200`
-  - `Vibe Coding/blockwage/docker/docker-compose.yml#L1-111`
-
-- Tests:
-  - `Vibe Coding/blockwage/test/contracts/payroll.test.js#L1-211`
-
----
-
-## CI & Docker
-
-- GitHub Actions workflow provided for contracts/backend/scheduler and docker image build:
-  - `Vibe Coding/blockwage/.github/workflows/ci.yml#L1-200`
-
-- Docker compose to run backend + scheduler (development):
-  - `Vibe Coding/blockwage/docker/docker-compose.yml#L1-111`
-
-Each service expects a `Dockerfile` in `backend/` and `scheduler/`. The compose file mounts source code for development; for production, build immutable images and run with a process manager / orchestrator.
 
 ---
 

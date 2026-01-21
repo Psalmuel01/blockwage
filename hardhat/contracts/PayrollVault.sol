@@ -1,6 +1,6 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
 /*
-  Vibe Coding/blockwage/contracts/PayrollVault.sol
-
   PayrollVault.sol - Vault for storing stablecoins (devUSDC.e) and releasing payroll settlements.
 
   Responsibilities:
@@ -19,12 +19,10 @@
   - The SalarySchedule contract is used to check due-ness and to confirm paid periods (confirmPaid).
 */
 
-pragma solidity ^0.8.17;
-
 // OpenZeppelin imports
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 interface ISalarySchedule {
@@ -124,7 +122,7 @@ contract PayrollVault is Ownable, ReentrancyGuard {
         address _token,
         address _salarySchedule,
         address _paymentVerifier
-    ) {
+    ) Ownable(msg.sender) {
         require(_token != address(0), "token-zero");
         token = IERC20(_token);
 

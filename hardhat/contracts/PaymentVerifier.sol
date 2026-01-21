@@ -1,4 +1,3 @@
-```Vibe Coding/blockwage/contracts/PaymentVerifier.sol#L1-200
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
 
@@ -31,16 +30,30 @@ pragma solidity ^0.8.17;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract PaymentVerifier is Ownable {
+abstract contract PaymentVerifier is Ownable {
     // mapping employee => periodId => verified
     mapping(address => mapping(uint256 => bool)) private _verified;
 
     // mapping of raw proof hash => bool (prevent submitting same raw proof multiple times)
     mapping(bytes32 => bool) private _proofSeen;
 
-    event PaymentVerified(address indexed employee, uint256 indexed periodId, uint256 amount, bytes32 proofHash, address indexed submitter);
-    event PaymentRejected(address indexed submitter, bytes32 proofHash, string reason);
-    event VerificationRevoked(address indexed employee, uint256 indexed periodId, address indexed admin);
+    event PaymentVerified(
+        address indexed employee,
+        uint256 indexed periodId,
+        uint256 amount,
+        bytes32 proofHash,
+        address indexed submitter
+    );
+    event PaymentRejected(
+        address indexed submitter,
+        bytes32 proofHash,
+        string reason
+    );
+    event VerificationRevoked(
+        address indexed employee,
+        uint256 indexed periodId,
+        address indexed admin
+    );
 
     /**
      * @notice Verify a facilitator proof and mark (employee, periodId) as verified.
@@ -55,7 +68,9 @@ contract PaymentVerifier is Ownable {
      * Note: This implementation only performs structural parsing + replay protection and basic sanity checks.
      * Replace or extend with cryptographic verification against facilitator attestation for production.
      */
-    function verifyPayment(bytes calldata facilitatorProof) external returns (bool) {
+    function verifyPayment(
+        bytes calldata facilitatorProof
+    ) external returns (bool) {
         bytes32 proofHash = keccak256(facilitatorProof);
 
         if (_proofSeen[proofHash]) {
@@ -106,7 +121,11 @@ contract PaymentVerifier is Ownable {
 
         // Prevent double verification for same employee/period
         if (_verified[employee][periodId]) {
-            emit PaymentRejected(msg.sender, proofHash, "employee-period-already-verified");
+            emit PaymentRejected(
+                msg.sender,
+                proofHash,
+                "employee-period-already-verified"
+            );
             // still mark proof seen to prevent repeated submissions of same invalid proof
             _proofSeen[proofHash] = true;
             return false;
@@ -132,7 +151,10 @@ contract PaymentVerifier is Ownable {
      * @param periodId Period identifier.
      * @return True if verified.
      */
-    function isVerified(address employee, uint256 periodId) external view returns (bool) {
+    function isVerified(
+        address employee,
+        uint256 periodId
+    ) external view returns (bool) {
         return _verified[employee][periodId];
     }
 
@@ -147,7 +169,10 @@ contract PaymentVerifier is Ownable {
      * @notice Emergency admin function to revoke a verification (for recovery/ops).
      * @dev Only callable by owner (payroll admin). Use with caution.
      */
-    function revokeVerification(address employee, uint256 periodId) external onlyOwner {
+    function revokeVerification(
+        address employee,
+        uint256 periodId
+    ) external onlyOwner {
         require(_verified[employee][periodId], "not-verified");
         _verified[employee][periodId] = false;
         emit VerificationRevoked(employee, periodId, msg.sender);

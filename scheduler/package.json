@@ -1,0 +1,82 @@
+```Vibe Coding/blockwage/scheduler/package.json#L1-200
+{
+  "name": "blockwage-scheduler",
+  "version": "0.1.0",
+  "description": "Scheduler service for BlockWage - listens to SalaryDue events and drives the x402 facilitator flow to payout employees on Cronos",
+  "private": true,
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "clean": "rimraf dist .tsbuildinfo",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "lint": "eslint 'src/**/*.{ts,js}' --fix",
+    "format": "prettier --write 'src/**/*.{ts,js,json,md}'",
+    "test": "jest --runInBand",
+    "test:watch": "jest --watchAll"
+  },
+  "keywords": [
+    "cronos",
+    "x402",
+    "payroll",
+    "scheduler",
+    "facilitator",
+    "blockwage"
+  ],
+  "author": "BlockWage Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "@crypto.com/facilitator-client": "latest",
+    "axios": "^1.4.0",
+    "cron": "^2.1.0",
+    "dotenv": "^16.0.3",
+    "ethers": "^6.8.0",
+    "p-retry": "^5.0.0",
+    "winston": "^3.8.2"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.2",
+    "@types/node": "^20.4.2",
+    "@types/cron": "^1.7.0",
+    "eslint": "^8.44.0",
+    "jest": "^29.6.0",
+    "nodemon": "^3.0.1",
+    "prettier": "^2.8.8",
+    "rimraf": "^5.0.0",
+    "ts-jest": "^29.1.0",
+    "ts-node": "^10.9.1",
+    "ts-node-dev": "^2.0.0",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.1.6"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "roots": [
+      "<rootDir>/src",
+      "<rootDir>/test"
+    ],
+    "testMatch": [
+      "**/?(*.)+(spec|test).[tj]s?(x)"
+    ],
+    "collectCoverageFrom": [
+      "src/**/*.ts"
+    ],
+    "coverageDirectory": "coverage"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://example.com/your-org/blockwage.git"
+  },
+  "optionalDependencies": {},
+  "config": {
+    "recommendedNode": ">=16"
+  }
+}

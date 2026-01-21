@@ -1,0 +1,111 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    image: blockwage-backend:latest
+    container_name: blockwage_backend
+    env_file:
+      - ../.env
+    environment:
+      - NODE_ENV=production
+      - PORT=${PORT:-3000}
+      - RPC_URL=${RPC_URL}
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - SALARY_SCHEDULE_ADDRESS=${SALARY_SCHEDULE_ADDRESS}
+      - PAYMENT_VERIFIER_ADDRESS=${PAYMENT_VERIFIER_ADDRESS}
+      - PAYROLL_VAULT_ADDRESS=${PAYROLL_VAULT_ADDRESS}
+      - STABLECOIN_ADDRESS=${STABLECOIN_ADDRESS}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - ../backend:/usr/src/app:cached
+      - backend_node_modules:/usr/src/app/node_modules
+      - ../backend/logs:/usr/src/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:${PORT:-3000}/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - blockwage_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  scheduler:
+    build:
+      context: ../scheduler
+      dockerfile: Dockerfile
+    image: blockwage-scheduler:latest
+    container_name: blockwage_scheduler
+    env_file:
+      - ../.env
+    environment:
+      - NODE_ENV=production
+      - RPC_URL=${RPC_URL}
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - SALARY_SCHEDULE_ADDRESS=${SALARY_SCHEDULE_ADDRESS}
+      - PAYMENT_VERIFIER_ADDRESS=${PAYMENT_VERIFIER_ADDRESS}
+      - PAYROLL_VAULT_ADDRESS=${PAYROLL_VAULT_ADDRESS}
+      - SCHED_CRON=${SCHED_CRON:-"0 9 * * 1"} # default: every Monday at 09:00 UTC
+      - SCHED_RETRIES=${SCHED_RETRIES:-5}
+      - SCHED_BACKOFF_MS=${SCHED_BACKOFF_MS:-2000}
+      - WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-10000}
+      - NOTIFY_SLACK_WEBHOOK=${NOTIFY_SLACK_WEBHOOK}
+      - NOTIFY_EMAIL=${NOTIFY_EMAIL}
+    volumes:
+      - ../scheduler:/usr/src/scheduler:cached
+      - scheduler_node_modules:/usr/src/scheduler/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"process.exit(0)\""] # lightweight: container up
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - blockwage_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: local facilitator emulator for integration tests (not required for production)
+  facilitator-emulator:
+    image: alpine:3.18
+    container_name: blockwage_facilitator_emulator
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+    environment:
+      - PORT=8081
+    networks:
+      - blockwage_net
+    restart: "no"
+
+volumes:
+  backend_node_modules:
+  scheduler_node_modules:
+
+networks:
+  blockwage_net:
+    driver: bridge
+
+# Notes:
+# - Place a .env file at the repo root (one level above this docker folder) with sensitive variables:
+#     PRIVATE_KEY, RPC_URL, SALARY_SCHEDULE_ADDRESS, PAYMENT_VERIFIER_ADDRESS, PAYROLL_VAULT_ADDRESS, STABLECOIN_ADDRESS, PORT
+# - Each service expects a Dockerfile in its context:
+#     - ../backend/Dockerfile should build the TypeScript Node.js server (install deps, build, run)
+#     - ../scheduler/Dockerfile should build the scheduler service (Node.js)
+# - The scheduler uses env var SCHED_CRON to configure scheduling cadence. The default shown is a sample.
+# - For local development mount volumes are used; for production consider removing source mounts and using immutable images.

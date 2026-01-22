@@ -298,8 +298,12 @@ export default function Dashboard() {
         }
         if (!SALARY_SCHEDULE_ADDRESS)
           throw new Error("SalarySchedule contract address not configured.");
+        if (!PAYROLL_VAULT_ADDRESS)
+          throw new Error("PayrollVault contract address not configured.");
         const signer = await (wallet as any).provider.getSigner();
         const schedule = getSalaryScheduleContract(signer);
+        const vault = getPayrollVaultContract(signer);
+
         const amt = await parseTokenAmount(
           assignSalary,
           STABLECOIN_ADDRESS,
@@ -311,7 +315,13 @@ export default function Dashboard() {
           message: "sending assignEmployee transaction",
           meta: { to: assignAddr, amount: assignSalary },
         });
-        const tx = await schedule.assignEmployee(
+        const tx = await vault.assignEmployee(
+          assignAddr,
+          amt,
+          assignCadence,
+          assignLastPaid
+        );
+        await schedule.assignEmployee(
           assignAddr,
           amt,
           assignCadence,
@@ -641,37 +651,89 @@ export default function Dashboard() {
 
   const simulateFacilitatorForClaim = useCallback(
     async (addr: string) => {
-      addLog({
-        level: "debug",
-        action: "SimulateFacilitator_clicked",
-        message: "clicked simulate",
-        meta: { addr },
-      });
       if (!addr) {
         showAlert("error", "Employee address required for simulation.");
         return null;
       }
-      const x402 = buildX402Body(addr);
-      if (!x402) {
-        showAlert(
-          "error",
-          "No x402 payload available. Fetch employee info first."
-        );
-        return null;
-      }
-      setStatus("Simulating facilitator payment...");
+
+      const backend = process.env.NEXT_PUBLIC_BACKEND_URL || DEFAULT_BACKEND;
+      const baseUrl = backend.replace(/\/$/, "");
+
+      setStatus("Claiming salary...");
+      addLog({
+        level: "info",
+        action: "SimulateFacilitator",
+        message: "Starting claim flow",
+        meta: { addr },
+      });
+
       try {
-        const backend = process.env.NEXT_PUBLIC_BACKEND_URL || DEFAULT_BACKEND;
-        const url = `${backend.replace(/\/$/, "")}/simulate-facilitator`;
-        const resp = await axios.post(url, { x402 });
+        // Step 1: Claim salary (x402)
+        let x402: any;
+        try {
+          await axios.get(`${baseUrl}/salary/claim/${addr}`);
+        } catch (err: any) {
+          // Axios throws on 402
+          if (err.response?.status === 402 && err.response?.data?.x402) {
+            x402 = err.response.data.x402;
+            addLog({
+              level: "info",
+              action: "SalaryClaimed",
+              message: "Payment required received",
+              meta: x402,
+            });
+            showAlert("info", "Payment required; proceeding with simulator.");
+          } else {
+            throw err;
+          }
+        }
+
+        if (!x402) {
+          showAlert("error", "No x402 payload returned from claim.");
+          return null;
+        }
+
+        setStatus("Simulating facilitator...");
+        // Step 2: Call simulator
+        const simulateResp = await axios.post(
+          `${baseUrl}/simulate-facilitator`,
+          { x402 }
+        );
+        const facilitatorProof = simulateResp.data?.proof;
+        if (!facilitatorProof) {
+          showAlert("error", "Simulator did not return a proof.");
+          addLog({
+            level: "error",
+            action: "SimulateFacilitator",
+            message: "No proof returned",
+            meta: simulateResp.data,
+          });
+          return null;
+        }
         addLog({
           level: "info",
           action: "SimulateFacilitator",
-          message: "simulator returned",
-          meta: resp.data,
+          message: "Proof generated",
+          meta: { proofSnippet: facilitatorProof.slice(0, 20) },
         });
         showAlert("success", "Simulator proof generated.");
-        return resp.data;
+
+        setStatus("Verifying salary...");
+        // Step 3: Verify
+        const verifyResp = await axios.post(`${baseUrl}/salary/verify`, {
+          facilitatorProof,
+          employee: addr,
+          periodId: x402.periodId,
+        });
+        addLog({
+          level: "info",
+          action: "SalaryVerified",
+          message: "Salary released successfully",
+          meta: verifyResp.data,
+        });
+        showAlert("success", "Salary verified and paid!");
+
+        return { x402, facilitatorProof, verifyResp: verifyResp.data };
       } catch (err: any) {
         addLog({
           level: "error",
@@ -681,14 +743,14 @@ export default function Dashboard() {
         });
         showAlert(
           "error",
-          "Simulator failed: " + (err?.message || "network error")
+          "Simulator flow failed: " + (err?.message || "network error")
         );
         return null;
       } finally {
         setStatus(null);
       }
     },
-    [addLog, buildX402Body, showAlert]
+    [showAlert, addLog]
   );
 
   /* ===========================

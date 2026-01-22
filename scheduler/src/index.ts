@@ -1,6 +1,4 @@
-```Vibe Coding/blockwage/scheduler/src/index.ts#L1-400
 /**
- * Vibe Coding/blockwage/scheduler/src/index.ts
  *
  * Scheduler service that:
  *  - Listens to `SalaryDue` events from the SalarySchedule contract on Cronos (x402 flow trigger)

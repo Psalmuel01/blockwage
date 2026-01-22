@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 import { ethers } from "ethers";
 import winston from "winston";
 import bodyParser from "body-parser";
-
+import cors from "cors";
 dotenv.config();
 
 /**
@@ -184,6 +184,15 @@ const processedPayouts = new Set<string>();
    =========================== */
 const app = express();
 app.use(bodyParser.json());
+
+// Configure CORS to allow your client's origin
+// app.use(
+//   cors({
+//     origin: "http://localhost:3000",
+//   })
+// );
+
+app.use(cors());
 
 // Request logger
 app.use((req: Request, _res: Response, next: NextFunction) => {

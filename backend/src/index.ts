@@ -1,4 +1,3 @@
-```Vibe Coding/blockwage/backend/src/index.ts#L1-400
 import express, { Request, Response, NextFunction } from "express";
 import dotenv from "dotenv";
 import { ethers } from "ethers";
@@ -39,8 +38,8 @@ const logger = winston.createLogger({
     winston.format.timestamp(),
     winston.format.printf(
       ({ timestamp, level, message, ...meta }) =>
-        `${timestamp} [${level}] ${message} ${Object.keys(meta).length ? JSON.stringify(meta) : ""}`
-    )
+        `${timestamp} [${level}] ${message} ${Object.keys(meta).length ? JSON.stringify(meta) : ""}`,
+    ),
   ),
   transports: [new winston.transports.Console()],
 });
@@ -57,15 +56,21 @@ const STABLECOIN_ADDRESS = process.env.STABLECOIN_ADDRESS || "";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
 if (!PRIVATE_KEY) {
-  logger.warn("PRIVATE_KEY not set - some endpoints requiring on-chain signatures will fail");
+  logger.warn(
+    "PRIVATE_KEY not set - some endpoints requiring on-chain signatures will fail",
+  );
 }
 
 if (!SALARY_SCHEDULE_ADDRESS) {
-  logger.warn("SALARY_SCHEDULE_ADDRESS not set - GET /salary/claim will be limited");
+  logger.warn(
+    "SALARY_SCHEDULE_ADDRESS not set - GET /salary/claim will be limited",
+  );
 }
 
 if (!STABLECOIN_ADDRESS) {
-  logger.warn("STABLECOIN_ADDRESS not set - x402 responses may have empty token");
+  logger.warn(
+    "STABLECOIN_ADDRESS not set - x402 responses may have empty token",
+  );
 }
 
 /* ===========================
@@ -95,7 +100,9 @@ const PayrollVaultABI = [
    Ethers setup
    =========================== */
 const provider = new ethers.JsonRpcProvider(RPC_URL);
-const signer = PRIVATE_KEY ? new ethers.Wallet(PRIVATE_KEY, provider) : undefined;
+const signer = PRIVATE_KEY
+  ? new ethers.Wallet(PRIVATE_KEY, provider)
+  : undefined;
 
 let salaryScheduleContract: ethers.Contract | undefined = undefined;
 let paymentVerifierContract: ethers.Contract | undefined = undefined;
@@ -103,13 +110,25 @@ let payrollVaultContract: ethers.Contract | undefined = undefined;
 
 try {
   if (SALARY_SCHEDULE_ADDRESS) {
-    salaryScheduleContract = new ethers.Contract(SALARY_SCHEDULE_ADDRESS, SalaryScheduleABI, provider);
+    salaryScheduleContract = new ethers.Contract(
+      SALARY_SCHEDULE_ADDRESS,
+      SalaryScheduleABI,
+      provider,
+    );
   }
   if (PAYMENT_VERIFIER_ADDRESS) {
-    paymentVerifierContract = new ethers.Contract(PAYMENT_VERIFIER_ADDRESS, PaymentVerifierABI, signer ?? provider);
+    paymentVerifierContract = new ethers.Contract(
+      PAYMENT_VERIFIER_ADDRESS,
+      PaymentVerifierABI,
+      signer ?? provider,
+    );
   }
   if (PAYROLL_VAULT_ADDRESS) {
-    payrollVaultContract = new ethers.Contract(PAYROLL_VAULT_ADDRESS, PayrollVaultABI, signer ?? provider);
+    payrollVaultContract = new ethers.Contract(
+      PAYROLL_VAULT_ADDRESS,
+      PayrollVaultABI,
+      signer ?? provider,
+    );
   }
 } catch (err) {
   logger.error("Failed to instantiate contracts", { error: err });
@@ -136,7 +155,9 @@ class FacilitatorWrapper {
       const sdk = require("@crypto.com/facilitator-client");
       // The actual SDK shapes may vary; adapt as needed. We'll wrap basic operations used by the app.
       this.client = {
-        createPayment: sdk.createPayment ? sdk.createPayment.bind(sdk) : undefined,
+        createPayment: sdk.createPayment
+          ? sdk.createPayment.bind(sdk)
+          : undefined,
         verifyProof: sdk.verifyProof ? sdk.verifyProof.bind(sdk) : undefined,
       };
       this.available = true;
@@ -145,7 +166,9 @@ class FacilitatorWrapper {
       // Not fatal: use stub behavior
       this.client = null;
       this.available = false;
-      logger.warn("Facilitator SDK not available; using local stub behavior", { reason: (e as Error).message });
+      logger.warn("Facilitator SDK not available; using local stub behavior", {
+        reason: (e as Error).message,
+      });
     }
   }
 
@@ -186,7 +209,10 @@ app.use(bodyParser.json());
 
 // Simple request logger
 app.use((req: Request, _res: Response, next: NextFunction) => {
-  logger.info(`HTTP ${req.method} ${req.path}`, { query: req.query, body: req.body });
+  logger.info(`HTTP ${req.method} ${req.path}`, {
+    query: req.query,
+    body: req.body,
+  });
   next();
 });
 
@@ -196,71 +222,93 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
  * Returns a 402 Payment Required response (x402 style) when there's a salary due for the employee.
  * The caller (employee or facilitator) should use the provided details to initiate a facilitator payment.
  */
-app.get("/salary/claim/:employeeAddress", async (req: Request, res: Response) => {
-  const { employeeAddress } = req.params;
+app.get(
+  "/salary/claim/:employeeAddress",
+  async (req: Request, res: Response) => {
+    const { employeeAddress } = req.params;
 
-  // Validate address
-  if (!ethers.isAddress(employeeAddress)) {
-    return res.status(400).json({ error: "invalid-employee-address" });
-  }
-
-  try {
-    // If SalarySchedule contract is available, fetch employee metadata
-    let salary = "0";
-    let periodId = 0;
-    let exists = false;
-
-    if (salaryScheduleContract) {
-      try {
-        // call getEmployee
-        const employeeInfo: [ethers.BigNumberish, number, ethers.BigNumberish, boolean] =
-          await salaryScheduleContract.getEmployee(employeeAddress);
-        const [salaryBn, cadence, lastPaid, existsFlag] = employeeInfo;
-        exists = existsFlag;
-        salary = salaryBn.toString();
-      } catch (err) {
-        logger.warn("getEmployee call failed; falling back to nextExpectedPeriod", { error: (err as Error).message });
-      }
-
-      try {
-        const nextPeriod: ethers.BigNumberish = await salaryScheduleContract.nextExpectedPeriod(employeeAddress);
-        periodId = Number(nextPeriod.toString());
-      } catch (err) {
-        logger.warn("nextExpectedPeriod call failed", { error: (err as Error).message });
-        periodId = Math.floor(Date.now() / 1000); // fallback to now
-      }
-    } else {
-      logger.warn("SalarySchedule contract not configured; returning best-effort x402 response");
-      // Best-effort fallback: no on-chain info available => ask caller to provide amount via query param
-      salary = req.query.amount ? String(req.query.amount) : "0";
-      periodId = Math.floor(Date.now() / 1000);
+    // Validate address
+    if (!ethers.isAddress(employeeAddress)) {
+      return res.status(400).json({ error: "invalid-employee-address" });
     }
 
-    // If no salary assigned, return 404
-    if (salary === "0") {
-      return res.status(404).json({ error: "no-salary-assigned", message: "No salary information available for this employee" });
+    try {
+      // If SalarySchedule contract is available, fetch employee metadata
+      let salary = "0";
+      let periodId = 0;
+      let exists = false;
+
+      if (salaryScheduleContract) {
+        try {
+          // call getEmployee
+          const employeeInfo: [
+            ethers.BigNumberish,
+            number,
+            ethers.BigNumberish,
+            boolean,
+          ] = await salaryScheduleContract.getEmployee(employeeAddress);
+          const [salaryBn, cadence, lastPaid, existsFlag] = employeeInfo;
+          exists = existsFlag;
+          salary = salaryBn.toString();
+        } catch (err) {
+          logger.warn(
+            "getEmployee call failed; falling back to nextExpectedPeriod",
+            { error: (err as Error).message },
+          );
+        }
+
+        try {
+          const nextPeriod: ethers.BigNumberish =
+            await salaryScheduleContract.nextExpectedPeriod(employeeAddress);
+          periodId = Number(nextPeriod.toString());
+        } catch (err) {
+          logger.warn("nextExpectedPeriod call failed", {
+            error: (err as Error).message,
+          });
+          periodId = Math.floor(Date.now() / 1000); // fallback to now
+        }
+      } else {
+        logger.warn(
+          "SalarySchedule contract not configured; returning best-effort x402 response",
+        );
+        // Best-effort fallback: no on-chain info available => ask caller to provide amount via query param
+        salary = req.query.amount ? String(req.query.amount) : "0";
+        periodId = Math.floor(Date.now() / 1000);
+      }
+
+      // If no salary assigned, return 404
+      if (salary === "0") {
+        return res
+          .status(404)
+          .json({
+            error: "no-salary-assigned",
+            message: "No salary information available for this employee",
+          });
+      }
+
+      // Build x402 style 402 response body
+      const x402Body = {
+        to: employeeAddress,
+        amount: salary,
+        token: STABLECOIN_ADDRESS,
+        periodId,
+        currency: "USDC", // human friendly
+      };
+
+      // x402 uses HTTP 402 Payment Required. We include JSON body that facilitator/scheduler can interpret.
+      res.status(402).set("Content-Type", "application/x402+json").json({
+        code: 402,
+        message: "Payment Required",
+        x402: x402Body,
+      });
+    } catch (err) {
+      logger.error("Error in /salary/claim handler", {
+        error: (err as Error).message,
+      });
+      return res.status(500).json({ error: "internal_error" });
     }
-
-    // Build x402 style 402 response body
-    const x402Body = {
-      to: employeeAddress,
-      amount: salary,
-      token: STABLECOIN_ADDRESS,
-      periodId,
-      currency: "USDC", // human friendly
-    };
-
-    // x402 uses HTTP 402 Payment Required. We include JSON body that facilitator/scheduler can interpret.
-    res.status(402).set("Content-Type", "application/x402+json").json({
-      code: 402,
-      message: "Payment Required",
-      x402: x402Body,
-    });
-  } catch (err) {
-    logger.error("Error in /salary/claim handler", { error: (err as Error).message });
-    return res.status(500).json({ error: "internal_error" });
-  }
-});
+  },
+);
 
 /**
  * POST /salary/verify
@@ -291,7 +339,9 @@ app.post("/salary/verify", async (req: Request, res: Response) => {
     // Idempotence key for (employee, periodId) string
     const payoutKey = `${employee.toLowerCase()}:${periodId}`;
     if (processedPayouts.has(payoutKey)) {
-      logger.info("Payout already processed; returning idempotent success", { payoutKey });
+      logger.info("Payout already processed; returning idempotent success", {
+        payoutKey,
+      });
       return res.status(200).json({ result: "already_processed", payoutKey });
     }
 
@@ -312,23 +362,32 @@ app.post("/salary/verify", async (req: Request, res: Response) => {
       // For stronger verification, you'd decode logs/events to confirm PaymentVerifier registration,
       // or that facilitator proof was recorded. For now, we accept successful tx as proof.
       processedPayouts.add(payoutKey);
-      logger.info("Payout marked processed (via txHash)", { payoutKey, txHash });
+      logger.info("Payout marked processed (via txHash)", {
+        payoutKey,
+        txHash,
+      });
       return res.status(200).json({ result: "ok", txHash });
     }
 
     // Otherwise we expect facilitatorProof
     if (!facilitatorProof) {
-      return res.status(400).json({ error: "missing-facilitatorProof-or-txHash" });
+      return res
+        .status(400)
+        .json({ error: "missing-facilitatorProof-or-txHash" });
     }
 
     // Prevent reprocessing the same raw proof
     if (verifiedProofs.has(facilitatorProof)) {
-      logger.info("Proof already verified earlier; proceeding to safe on-chain release if needed");
+      logger.info(
+        "Proof already verified earlier; proceeding to safe on-chain release if needed",
+      );
     } else {
       // Use optional SDK to verify proof format / signature
       const sdkOk = await facilitator.verifyProof(facilitatorProof);
       if (!sdkOk) {
-        logger.warn("Facilitator SDK reject proof; awating on-chain verifier", { proofSnippet: facilitatorProof.slice(0, 20) });
+        logger.warn("Facilitator SDK reject proof; awating on-chain verifier", {
+          proofSnippet: facilitatorProof.slice(0, 20),
+        });
         // We still proceed to call on-chain verifyPayment for authoritative verification (PaymentVerifier)
       }
       // Mark as locally verified for idempotence
@@ -346,10 +405,16 @@ app.post("/salary/verify", async (req: Request, res: Response) => {
     }
 
     // Send verifyPayment tx
-    logger.info("Calling PaymentVerifier.verifyPayment on-chain", { verifier: PAYMENT_VERIFIER_ADDRESS });
-    const verifyTx = await paymentVerifierContract.connect(signer).verifyPayment(ethers.getBytes(facilitatorProof));
+    logger.info("Calling PaymentVerifier.verifyPayment on-chain", {
+      verifier: PAYMENT_VERIFIER_ADDRESS,
+    });
+    const verifyTx = await paymentVerifierContract
+      .connect(signer)
+      .verifyPayment(ethers.getBytes(facilitatorProof));
     const verifyReceipt = await verifyTx.wait();
-    logger.info("PaymentVerifier.verifyPayment tx mined", { txHash: verifyReceipt.transactionHash });
+    logger.info("PaymentVerifier.verifyPayment tx mined", {
+      txHash: verifyReceipt.transactionHash,
+    });
 
     // After proof accepted on-chain, trigger vault release
     if (!payrollVaultContract) {
@@ -358,14 +423,23 @@ app.post("/salary/verify", async (req: Request, res: Response) => {
     }
 
     // releaseSalary is owner-only; server must be owner or operate via admin signer
-    logger.info("Calling PayrollVault.releaseSalary to release funds", { vault: PAYROLL_VAULT_ADDRESS, employee, periodId });
-    const releaseTx = await payrollVaultContract.connect(signer).releaseSalary(employee, BigInt(periodId));
+    logger.info("Calling PayrollVault.releaseSalary to release funds", {
+      vault: PAYROLL_VAULT_ADDRESS,
+      employee,
+      periodId,
+    });
+    const releaseTx = await payrollVaultContract
+      .connect(signer)
+      .releaseSalary(employee, BigInt(periodId));
     const releaseReceipt = await releaseTx.wait();
 
     // Mark payout processed to ensure idempotence
     processedPayouts.add(payoutKey);
 
-    logger.info("Salary released successfully", { payoutKey, releaseTxHash: releaseReceipt.transactionHash });
+    logger.info("Salary released successfully", {
+      payoutKey,
+      releaseTxHash: releaseReceipt.transactionHash,
+    });
 
     return res.status(200).json({
       result: "ok",
@@ -374,8 +448,13 @@ app.post("/salary/verify", async (req: Request, res: Response) => {
       payoutKey,
     });
   } catch (err) {
-    logger.error("Error in /salary/verify handler", { error: (err as Error).message, body: req.body });
-    return res.status(500).json({ error: "internal_error", reason: (err as Error).message });
+    logger.error("Error in /salary/verify handler", {
+      error: (err as Error).message,
+      body: req.body,
+    });
+    return res
+      .status(500)
+      .json({ error: "internal_error", reason: (err as Error).message });
   }
 });
 
@@ -399,5 +478,7 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
    =========================== */
 app.listen(PORT, () => {
   logger.info(`BlockWage backend listening on port ${PORT}`);
-  logger.info(`Configured contracts: SalarySchedule=${SALARY_SCHEDULE_ADDRESS} PaymentVerifier=${PAYMENT_VERIFIER_ADDRESS} PayrollVault=${PAYROLL_VAULT_ADDRESS}`);
+  logger.info(
+    `Configured contracts: SalarySchedule=${SALARY_SCHEDULE_ADDRESS} PaymentVerifier=${PAYMENT_VERIFIER_ADDRESS} PayrollVault=${PAYROLL_VAULT_ADDRESS}`,
+  );
 });

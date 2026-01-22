@@ -1,4 +1,3 @@
-```Vibe Coding/blockwage/backend/src/verifier.ts#L1-200
 /**
  * Vibe Coding/blockwage/backend/src/verifier.ts
  *
@@ -25,7 +24,15 @@ import { ParsedFacilitatorProof } from "./x402";
 /**
  * Minimal shape accepted by Verifier.verify
  */
-export type VerifierInput = ParsedFacilitatorProof | { rawHex: string; employee?: string; periodId?: bigint | number; amount?: bigint | number } | string;
+export type VerifierInput =
+  | ParsedFacilitatorProof
+  | {
+      rawHex: string;
+      employee?: string;
+      periodId?: bigint | number;
+      amount?: bigint | number;
+    }
+  | string;
 
 export class Verifier {
   // Set of raw proof hex strings that have been seen/verified locally
@@ -55,7 +62,10 @@ export class Verifier {
    *
    * For tests & local flows the caller typically expects `true` when proof looks valid.
    */
-  async verify(input: VerifierInput, opts?: { markProcessed?: boolean }): Promise<boolean> {
+  async verify(
+    input: VerifierInput,
+    opts?: { markProcessed?: boolean }
+  ): Promise<boolean> {
     // Normalize input to an object with rawHex, employee, periodId, amount
     const normalized = this.normalizeInput(input);
     if (!normalized) return false;
@@ -66,7 +76,11 @@ export class Verifier {
     if (!rawHex || typeof rawHex !== "string") {
       return false;
     }
-    if (!employee || typeof employee !== "string" || employee === "0x0000000000000000000000000000000000000000") {
+    if (
+      !employee ||
+      typeof employee !== "string" ||
+      employee === "0x0000000000000000000000000000000000000000"
+    ) {
       return false;
     }
     if (!periodId || BigInt(periodId) === 0n) {
@@ -114,7 +128,10 @@ export class Verifier {
   /**
    * Whether a payout (employee + periodId) has been processed locally
    */
-  isPayoutProcessed(employee: string, periodId: bigint | number | string): boolean {
+  isPayoutProcessed(
+    employee: string,
+    periodId: bigint | number | string
+  ): boolean {
     return this.processedPayouts.has(this.keyFor(employee, periodId));
   }
 
@@ -139,11 +156,19 @@ export class Verifier {
 
   private keyFor(employee: string, periodId: bigint | number | string) {
     const emp = employee.toLowerCase();
-    const pid = typeof periodId === "bigint" ? periodId.toString() : String(periodId);
+    const pid =
+      typeof periodId === "bigint" ? periodId.toString() : String(periodId);
     return `${emp}:${pid}`;
   }
 
-  private normalizeInput(input: VerifierInput): { rawHex: string; employee: string; periodId: bigint; amount: bigint } | null {
+  private normalizeInput(
+    input: VerifierInput
+  ): {
+    rawHex: string;
+    employee: string;
+    periodId: bigint;
+    amount: bigint;
+  } | null {
     // If input is a string, treat it as rawHex
     if (typeof input === "string") {
       const rawHex = input;
@@ -166,7 +191,13 @@ export class Verifier {
 
     // If input appears to be a ParsedFacilitatorProof
     const maybe = input as ParsedFacilitatorProof | any;
-    if (maybe && typeof maybe.rawHex === "string" && maybe.employee && (maybe.periodId !== undefined) && (maybe.amount !== undefined)) {
+    if (
+      maybe &&
+      typeof maybe.rawHex === "string" &&
+      maybe.employee &&
+      maybe.periodId !== undefined &&
+      maybe.amount !== undefined
+    ) {
       const rawHex = maybe.rawHex;
       const employee = String(maybe.employee);
       const periodId = BigInt(maybe.periodId);
@@ -177,8 +208,11 @@ export class Verifier {
     // If input is an object with rawHex and optional fields
     if (maybe && typeof maybe.rawHex === "string") {
       const rawHex = maybe.rawHex;
-      const employee = maybe.employee ? String(maybe.employee) : "0x0000000000000000000000000000000000000000";
-      const periodId = maybe.periodId !== undefined ? BigInt(maybe.periodId) : 0n;
+      const employee = maybe.employee
+        ? String(maybe.employee)
+        : "0x0000000000000000000000000000000000000000";
+      const periodId =
+        maybe.periodId !== undefined ? BigInt(maybe.periodId) : 0n;
       const amount = maybe.amount !== undefined ? BigInt(maybe.amount) : 0n;
       return { rawHex, employee, periodId, amount };
     }

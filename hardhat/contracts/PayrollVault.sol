@@ -25,6 +25,13 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
+enum Cadence {
+    Minute, // for testing
+    Hourly,
+    Biweekly,
+    Monthly
+}
+
 interface ISalarySchedule {
     // Mirrors the SalarySchedule contract API used by this project
     function isDue(
@@ -39,25 +46,10 @@ interface ISalarySchedule {
     ) external;
 
     // Optional: try to sync assignment on the schedule
-    function assignEmployee(
-        address employee,
-        uint256 salary,
-        uint8 cadence,
-        uint256 initialLastPaid
-    ) external;
-}
 
-interface IPaymentVerifier {
-    // Checks whether an off-chain facilitator proof has been accepted for the employee/period
-    function isVerified(
-        address employee,
-        uint256 periodId
-    ) external view returns (bool);
-
-    // Verifier may also expose verifyPayment; not required to be called by the vault
-    function verifyPayment(
-        bytes calldata facilitatorProof
-    ) external returns (bool);
+    function getEmployee(
+        address _employee
+    ) external view returns (uint256, Cadence, uint256, bool);
 }
 
 contract PayrollVault is Ownable, ReentrancyGuard {
@@ -68,23 +60,9 @@ contract PayrollVault is Ownable, ReentrancyGuard {
 
     // Linked contracts
     ISalarySchedule public salarySchedule;
-    IPaymentVerifier public paymentVerifier;
 
     // Tracks per-period reserved balances (employer deposits tied to a periodId)
     mapping(uint256 => uint256) public periodBalances;
-
-    // Mirrored employee metadata (keeps local copy for quick reference)
-    enum Cadence {
-        Hourly,
-        Biweekly,
-        Monthly
-    }
-    struct EmployeeInfo {
-        uint256 salary; // amount per period (token smallest unit)
-        Cadence cadence;
-        bool exists;
-    }
-    mapping(address => EmployeeInfo) public employees;
 
     // Prevent double payout
     mapping(address => mapping(uint256 => bool)) public paid;
@@ -111,29 +89,18 @@ contract PayrollVault is Ownable, ReentrancyGuard {
     );
     event ExcessWithdrawn(address indexed to, uint256 amount);
     event SalaryScheduleUpdated(address indexed schedule);
-    event PaymentVerifierUpdated(address indexed verifier);
 
     /**
      * @param _token Stablecoin token address (devUSDC.e)
      * @param _salarySchedule SalarySchedule contract (can be zero initially)
-     * @param _paymentVerifier PaymentVerifier contract (can be zero initially)
      */
-    constructor(
-        address _token,
-        address _salarySchedule,
-        address _paymentVerifier
-    ) Ownable(msg.sender) {
+    constructor(address _token, address _salarySchedule) Ownable(msg.sender) {
         require(_token != address(0), "token-zero");
         token = IERC20(_token);
 
         if (_salarySchedule != address(0)) {
             salarySchedule = ISalarySchedule(_salarySchedule);
             emit SalaryScheduleUpdated(_salarySchedule);
-        }
-
-        if (_paymentVerifier != address(0)) {
-            paymentVerifier = IPaymentVerifier(_paymentVerifier);
-            emit PaymentVerifierUpdated(_paymentVerifier);
         }
     }
 
@@ -146,52 +113,6 @@ contract PayrollVault is Ownable, ReentrancyGuard {
         require(_schedule != address(0), "schedule-zero");
         salarySchedule = ISalarySchedule(_schedule);
         emit SalaryScheduleUpdated(_schedule);
-    }
-
-    /// @notice Update the PaymentVerifier contract address
-    function setPaymentVerifier(address _verifier) external onlyOwner {
-        require(_verifier != address(0), "verifier-zero");
-        paymentVerifier = IPaymentVerifier(_verifier);
-        emit PaymentVerifierUpdated(_verifier);
-    }
-
-    /// @notice Assign or update an employee in the vault mirror.
-    /// @dev Also attempts to call assignEmployee on the SalarySchedule if available (best-effort).
-    /// cadence: 0 = Hourly, 1 = Biweekly, 2 = Monthly
-    function assignEmployee(
-        address _employee,
-        uint256 _salary,
-        uint8 cadence,
-        uint256 initialLastPaid
-    ) external onlyOwner {
-        require(_employee != address(0), "employee-zero");
-        require(_salary > 0, "salary-zero");
-        require(cadence <= uint8(Cadence.Monthly), "invalid-cadence");
-
-        employees[_employee] = EmployeeInfo({
-            salary: _salary,
-            cadence: Cadence(cadence),
-            exists: true
-        });
-
-        emit EmployeeAssigned(_employee, _salary, Cadence(cadence));
-
-        // Best-effort: attempt to sync assignment on SalarySchedule (if set). Do not revert if it fails.
-        if (address(salarySchedule) != address(0)) {
-            // We wrap in a low-level call to avoid revert on unexpected behavior.
-            try
-                salarySchedule.assignEmployee(
-                    _employee,
-                    _salary,
-                    cadence,
-                    initialLastPaid
-                )
-            {
-                // synced
-            } catch {
-                // ignore if fails (owner can sync manually)
-            }
-        }
     }
 
     /* ======================
@@ -258,8 +179,12 @@ contract PayrollVault is Ownable, ReentrancyGuard {
         address employee,
         uint256 periodId
     ) external onlyOwner nonReentrant {
-        EmployeeInfo memory e = employees[employee];
-        require(e.exists, "employee-not-assigned");
+        // Get salary & existence directly from schedule
+        (uint256 salary, , , bool exists) = salarySchedule.getEmployee(
+            employee
+        );
+
+        require(exists, "employee-not-assigned-in-schedule");
         require(!paid[employee][periodId], "already-paid");
 
         // Validate schedule due-ness
@@ -273,17 +198,10 @@ contract PayrollVault is Ownable, ReentrancyGuard {
             revert("schedule-not-set");
         }
 
-        // Require payment proof verification
-        if (address(paymentVerifier) != address(0)) {
-            require(
-                paymentVerifier.isVerified(employee, periodId),
-                "payment-not-verified"
-            );
-        } else {
-            revert("verifier-not-set");
-        }
+        // x402 facilitator has already verified off-chain / real-world payment proof
+        // we only enforce schedule rules + sufficient on-chain reserves
 
-        uint256 amount = e.salary;
+        uint256 amount = salary;
         // Ensure period has enough balance; if not, fail
         require(
             periodBalances[periodId] >= amount,

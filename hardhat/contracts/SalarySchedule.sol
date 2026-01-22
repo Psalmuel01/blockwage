@@ -7,12 +7,13 @@ pragma solidity ^0.8.17;
  *
  * Responsibilities:
  *  - Maintain employee salary/cadence metadata
- *  - Validate pay periods for different cadences (Monthly / Biweekly / Hourly)
+ *  - Validate pay periods for different cadences (Monthly / Biweekly / Hourly / Minute)
  *  - Emit `SalaryDue` events when payroll is due (scheduler or owner triggers)
  *  - Integrate with a PayrollVault via a callback (`onSalaryDue`) so on-chain settlement can be coordinated
  *
  * Notes:
  *  - Period identifiers are represented as unix timestamps that MUST be aligned to the cadence window:
+ *      * Minute   -> seconds since epoch aligned to minute boundary (periodId % 60 == 0)
  *      * Hourly   -> seconds since epoch aligned to hour boundary (periodId % 3600 == 0)
  *      * Biweekly -> seconds since epoch aligned to 14-day boundary   (periodId % (14*24*3600) == 0)
  *      * Monthly  -> seconds since epoch aligned to 30-day boundary   (periodId % (30*24*3600) == 0)
@@ -43,6 +44,7 @@ interface IPayrollVault {
 
 contract SalarySchedule is Ownable, ReentrancyGuard {
     enum Cadence {
+        Minute, // for testing
         Hourly,
         Biweekly,
         Monthly
@@ -56,6 +58,7 @@ contract SalarySchedule is Ownable, ReentrancyGuard {
     }
 
     // cadence durations in seconds (used for validation)
+    uint256 public constant MINUTE = 60;
     uint256 public constant HOUR = 3600;
     uint256 public constant DAY = 24 * 3600;
     uint256 public constant BIWEEK = 14 * DAY;
@@ -186,6 +189,7 @@ contract SalarySchedule is Ownable, ReentrancyGuard {
      * @notice Calculate cadence duration in seconds
      */
     function cadenceDuration(Cadence c) public pure returns (uint256) {
+        if (c == Cadence.Minute) return MINUTE;
         if (c == Cadence.Hourly) return HOUR;
         if (c == Cadence.Biweekly) return BIWEEK;
         // Monthly approximated as 30 days for deterministic arithmetic
@@ -197,6 +201,7 @@ contract SalarySchedule is Ownable, ReentrancyGuard {
      *
      * periodId MUST be unix timestamp aligned to cadence duration since epoch.
      * Examples:
+     *  - Minute   : periodId % 60 == 0
      *  - Hourly   : periodId % 3600 == 0
      *  - Biweekly : periodId % (14*24*3600) == 0
      *  - Monthly  : periodId % (30*24*3600) == 0

@@ -47,7 +47,7 @@ import { useLogger } from "../lib/logger";
 
 type EmployeeInfo = {
   salary: string;
-  cadence: number;
+  cadence: 0 | 1 | 2 | 3;
   lastPaid: number;
   exists: boolean;
 };
@@ -90,7 +90,7 @@ export default function Dashboard() {
   // Form state: assign employee
   const [assignAddr, setAssignAddr] = useState("");
   const [assignSalary, setAssignSalary] = useState("1"); // human units
-  const [assignCadence, setAssignCadence] = useState<number>(2); // 0 hourly,1 biweekly,2 monthly
+  const [assignCadence, setAssignCadence] = useState<number>(3); // 0 minute, 1 hourly, 2 biweekly, 3 monthly
   const [assignLastPaid, setAssignLastPaid] = useState<number>(0);
   const [assignErrors, setAssignErrors] = useState<Record<string, string>>({});
 
@@ -298,11 +298,9 @@ export default function Dashboard() {
         }
         if (!SALARY_SCHEDULE_ADDRESS)
           throw new Error("SalarySchedule contract address not configured.");
-        if (!PAYROLL_VAULT_ADDRESS)
-          throw new Error("PayrollVault contract address not configured.");
+
         const signer = await (wallet as any).provider.getSigner();
         const schedule = getSalaryScheduleContract(signer);
-        const vault = getPayrollVaultContract(signer);
 
         const amt = await parseTokenAmount(
           assignSalary,
@@ -315,13 +313,7 @@ export default function Dashboard() {
           message: "sending assignEmployee transaction",
           meta: { to: assignAddr, amount: assignSalary },
         });
-        const tx = await vault.assignEmployee(
-          assignAddr,
-          amt,
-          assignCadence,
-          assignLastPaid
-        );
-        await schedule.assignEmployee(
+        const tx = await schedule.assignEmployee(
           assignAddr,
           amt,
           assignCadence,
@@ -851,9 +843,10 @@ export default function Dashboard() {
                     value={assignCadence}
                     onChange={(e) => setAssignCadence(Number(e.target.value))}
                   >
-                    <option value={2}>Monthly</option>
-                    <option value={1}>Biweekly</option>
-                    <option value={0}>Hourly</option>
+                    <option value={3}>Monthly</option>
+                    <option value={2}>Biweekly</option>
+                    <option value={1}>Hourly</option>
+                    <option value={0}>Minute</option>
                   </select>
                   {assignErrors.cadence && (
                     <div className="text-sm text-red-600 mt-1">

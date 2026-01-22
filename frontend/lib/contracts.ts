@@ -54,7 +54,6 @@ export const PayrollVaultABI = [
   // Token interactions & bookkeeping
   "function depositPayroll(uint256 periodId, uint256 amount) external",
   "function withdrawExcess(uint256 amount) external",
-  "function assignEmployee(address,uint256,uint8,uint256) external",
   "function releaseSalary(address employee, uint256 periodId) external",
   "function isPaid(address employee, uint256 periodId) view returns (bool)",
   // Views

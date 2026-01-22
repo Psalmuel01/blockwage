@@ -968,6 +968,18 @@ export default function Dashboard() {
                     on-chain release.
                   </p>
                 </div>
+
+                {/* Quick action: open the employee-facing claim page with the address prefilled */}
+                <div className="mt-4">
+                  <a
+                    className="inline-block px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700"
+                    href={`/claim?employee=${encodeURIComponent(
+                      lookupAddress
+                    )}`}
+                  >
+                    Open Claim Page (prefilled)
+                  </a>
+                </div>
               </div>
             </div>
           ) : (

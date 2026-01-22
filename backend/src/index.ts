@@ -5,6 +5,7 @@ import winston from "winston";
 import bodyParser from "body-parser";
 import crypto from "crypto";
 import axios from "axios";
+import cors from "cors";
 
 dotenv.config();
 
@@ -187,6 +188,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   });
   next();
 });
+
+app.use(cors());
 
 /* ===========================
    Core Endpoints

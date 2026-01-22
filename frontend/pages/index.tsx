@@ -1,4 +1,11 @@
-import { useContext, useEffect, useState } from "react";
+import React, {
+  useContext,
+  useEffect,
+  useState,
+  useRef,
+  useCallback,
+  useMemo,
+} from "react";
 import Head from "next/head";
 import { WalletContext } from "./_app";
 import {
@@ -7,7 +14,6 @@ import {
   getPayrollVaultContract,
   getStablecoinContract,
   getJsonRpcProvider,
-  formatTokenAmount,
   parseTokenAmount,
   SALARY_SCHEDULE_ADDRESS,
   PAYROLL_VAULT_ADDRESS,
@@ -17,22 +23,26 @@ import { ethers } from "ethers";
 import axios from "axios";
 import clsx from "clsx";
 
+import {
+  isValidAddress,
+  isPositiveNumberString,
+  isIntegerString,
+  validateAssignForm as validateAssignFormUtil,
+  validateDepositForm as validateDepositFormUtil,
+  validateTriggerForm as validateTriggerFormUtil,
+  errorMapToMessage,
+} from "../lib/validation";
+import { useLogger } from "../lib/logger";
+
 /**
- * Employer Dashboard + Embedded Claim Viewer (single page)
+ * Employer Dashboard — now using shared validation and logging utilities.
  *
- * Notes:
- * - This page implements:
- *   - Employer actions (assign employee, deposit payroll, trigger salary due)
- *   - Lightweight event view & employee info
- *   - Local claim viewer that constructs an x402 402-like response (for demo)
- *   - Simulate-facilitator call (POST to BACKEND_URL/simulate-facilitator or /simulate-facilitator)
+ * Key changes:
+ * - Validation helpers imported from `frontend/lib/validation`
+ * - Component-local logger uses `useLogger` from `frontend/lib/logger`
  *
- * - Admin actions require wallet connect (MetaMask / Cronos-compatible) and the connected address to be the contracts' owner.
- *
- * Environment:
- * - NEXT_PUBLIC_RPC_URL
- * - NEXT_PUBLIC_BACKEND_URL (e.g. http://localhost:3000)
- * - NEXT_PUBLIC_* contract addresses (optional placeholders)
+ * Behaviour is intentionally unchanged; this refactor extracts shared logic
+ * so other pages/components can reuse it.
  */
 
 type EmployeeInfo = {
@@ -45,62 +55,147 @@ type EmployeeInfo = {
 const DEFAULT_BACKEND =
   process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3000";
 
-/* Utility: short address for display */
-function short(addr?: string) {
-  if (!addr) return "";
-  return addr.slice(0, 6) + "..." + addr.slice(-4);
-}
+/* Small helpers */
+const short = (addr?: string) =>
+  addr ? addr.slice(0, 6) + "..." + addr.slice(-4) : "";
+const nowISO = () => new Date().toISOString();
 
 export default function Dashboard() {
   const wallet = useContext(WalletContext);
   const [status, setStatus] = useState<string | null>(null);
+
+  // use shared logger hook
+  const { logs, addLog, clearLogs } = useLogger();
+
+  // transient UI alert
+  const [alert, setAlert] = useState<{
+    type: "success" | "error" | "info";
+    text: string;
+  } | null>(null);
+  const alertTimer = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    return () => {
+      if (alertTimer.current) clearTimeout(alertTimer.current);
+    };
+  }, []);
+  const showAlert = useCallback(
+    (type: "success" | "error" | "info", text: string, ttl = 6000) => {
+      setAlert({ type, text });
+      if (alertTimer.current) clearTimeout(alertTimer.current);
+      alertTimer.current = setTimeout(() => setAlert(null), ttl);
+    },
+    []
+  );
 
   // Form state: assign employee
   const [assignAddr, setAssignAddr] = useState("");
   const [assignSalary, setAssignSalary] = useState("1"); // human units
   const [assignCadence, setAssignCadence] = useState<number>(2); // 0 hourly,1 biweekly,2 monthly
   const [assignLastPaid, setAssignLastPaid] = useState<number>(0);
+  const [assignErrors, setAssignErrors] = useState<Record<string, string>>({});
 
   // Deposit form
-  const [depositPeriodId, setDepositPeriodId] = useState<number>(
-    Math.floor(Date.now() / 1000)
+  const [depositPeriodId, setDepositPeriodId] = useState<string>(
+    String(Math.floor(Date.now() / 1000))
   );
   const [depositAmount, setDepositAmount] = useState("1");
+  const [depositErrors, setDepositErrors] = useState<Record<string, string>>(
+    {}
+  );
 
   // Trigger salary
   const [triggerEmployee, setTriggerEmployee] = useState("");
-  const [triggerPeriodId, setTriggerPeriodId] = useState<number>(
-    Math.floor(Date.now() / 1000)
+  const [triggerPeriodId, setTriggerPeriodId] = useState<string>(
+    String(Math.floor(Date.now() / 1000))
+  );
+  const [triggerErrors, setTriggerErrors] = useState<Record<string, string>>(
+    {}
   );
 
   // Employee info lookup
   const [lookupAddress, setLookupAddress] = useState("");
   const [employeeInfo, setEmployeeInfo] = useState<EmployeeInfo | null>(null);
   const [nextPeriod, setNextPeriod] = useState<number | null>(null);
+  const [lookupError, setLookupError] = useState<string | null>(null);
 
-  // Simple event list (SalaryDue events)
+  // Events
   const [events, setEvents] = useState<any[]>([]);
   const [loadingEvents, setLoadingEvents] = useState(false);
 
-  const rpcProvider = getJsonRpcProvider();
+  const rpcProvider = useMemo(() => getJsonRpcProvider(), []);
+
+  // Prefer browser provider (wallet) for reads when available
+  const getReadProvider = useCallback(() => {
+    if (wallet && (wallet as any).provider) return (wallet as any).provider;
+    const bp = getBrowserProvider();
+    if (bp) return bp;
+    return rpcProvider;
+  }, [wallet, rpcProvider]);
+
+  // Central error helper
+  const handleActionError = useCallback(
+    (action: string, err: any) => {
+      const msg = err?.message || String(err);
+      addLog({
+        level: "error",
+        action: `${action}_failed`,
+        message: msg,
+        meta: err,
+      });
+      setStatus(`${action} failed: ${msg}`);
+      showAlert("error", `${action} failed: ${msg}`);
+    },
+    [addLog, showAlert]
+  );
 
   useEffect(() => {
-    // load recent SalaryDue events (best-effort)
-    fetchEvents().catch((e) => console.warn("fetchEvents failed", e));
+    const to = setTimeout(() => {
+      fetchEvents().catch((e) =>
+        addLog({
+          level: "error",
+          action: "fetchEvents",
+          message: "initial fetch failed",
+          meta: e,
+        })
+      );
+    }, 150);
+    return () => clearTimeout(to);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function fetchEvents() {
+  const fetchEvents = useCallback(async () => {
+    addLog({ level: "debug", action: "fetchEvents", message: "clicked/auto" });
     if (!SALARY_SCHEDULE_ADDRESS) {
+      addLog({
+        level: "info",
+        action: "fetchEvents",
+        message: "SalarySchedule address not configured; skipping events",
+      });
       setEvents([]);
       return;
     }
     setLoadingEvents(true);
     try {
-      const provider = rpcProvider;
+      const provider = getReadProvider();
+      let latest: number;
+      try {
+        const blockNumber = await provider.getBlockNumber();
+        latest = Number(blockNumber);
+      } catch (err) {
+        addLog({
+          level: "error",
+          action: "fetchEvents",
+          message: "Provider unavailable",
+          meta: String(err),
+        });
+        setStatus(
+          "RPC provider unavailable. Connect a wallet or set NEXT_PUBLIC_RPC_URL."
+        );
+        setEvents([]);
+        setLoadingEvents(false);
+        return;
+      }
       const contract = getSalaryScheduleContract(provider);
-      const latest = await provider.getBlockNumber();
-      // conservative scan range: last 5000 blocks (adjust as needed)
       const fromBlock = Math.max(0, latest - 5000);
       const evts = await contract.queryFilter(
         contract.filters.SalaryDue(),
@@ -116,205 +211,488 @@ export default function Dashboard() {
         blockNumber: e.blockNumber,
       }));
       setEvents(mapped.reverse());
+      addLog({
+        level: "info",
+        action: "fetchEvents",
+        message: `loaded ${mapped.length} events`,
+      });
     } catch (err) {
-      console.error("Failed to fetch events", err);
+      addLog({
+        level: "error",
+        action: "fetchEvents",
+        message: "Failed to fetch events",
+        meta: err,
+      });
       setEvents([]);
     } finally {
       setLoadingEvents(false);
     }
-  }
+  }, [addLog, getReadProvider]);
 
   /* ===========================
-     Admin actions (wallet-signed)
+     Form validation helpers (use shared utils)
+     =========================== */
+  const validateAssignForm = useCallback(() => {
+    const errs = validateAssignFormUtil({
+      addr: assignAddr,
+      salary: assignSalary,
+      cadence: assignCadence,
+      lastPaid: assignLastPaid,
+    });
+    setAssignErrors(errs);
+    return Object.keys(errs).length === 0;
+  }, [assignAddr, assignSalary, assignCadence, assignLastPaid]);
+
+  const validateDepositForm = useCallback(() => {
+    const errs = validateDepositFormUtil({
+      periodId: depositPeriodId,
+      amount: depositAmount,
+    });
+    setDepositErrors(errs);
+    return Object.keys(errs).length === 0;
+  }, [depositPeriodId, depositAmount]);
+
+  const validateTriggerForm = useCallback(() => {
+    const errs = validateTriggerFormUtil({
+      employee: triggerEmployee,
+      periodId: triggerPeriodId,
+    });
+    setTriggerErrors(errs);
+    return Object.keys(errs).length === 0;
+  }, [triggerEmployee, triggerPeriodId]);
+
+  /* ===========================
+     Action handlers
      =========================== */
 
-  async function assignEmployeeHandler(e: React.FormEvent) {
-    e.preventDefault();
-    setStatus("Assigning employee...");
-    try {
-      if (!wallet || !wallet.provider) throw new Error("Connect wallet first");
-      const signer = await wallet.provider.getSigner();
-      const schedule = getSalaryScheduleContract(signer);
-      // parse salary to smallest-unit (assume USDC 6 decimals)
-      const amountBn = await parseTokenInput(
-        assignSalary,
-        STABLECOIN_ADDRESS,
-        signer
-      );
-      const tx = await schedule.assignEmployee(
-        assignAddr,
-        amountBn,
-        assignCadence,
-        assignLastPaid
-      );
-      setStatus("Tx sent: " + tx.hash);
-      await tx.wait();
-      setStatus("Employee assigned. Refetching info...");
-      await refreshEmployee(assignAddr);
-    } catch (err: any) {
-      console.error(err);
-      setStatus("Error: " + (err?.message || String(err)));
-    }
-  }
-
-  async function depositHandler(e: React.FormEvent) {
-    e.preventDefault();
-    setStatus("Depositing payroll...");
-    try {
-      if (!wallet || !wallet.provider) throw new Error("Connect wallet first");
-      const signer = await wallet.provider.getSigner();
-      const token = getStablecoinContract(STABLECOIN_ADDRESS, signer);
-      const vault = getPayrollVaultContract(signer);
-      const amountBn = await parseTokenInput(
-        depositAmount,
-        STABLECOIN_ADDRESS,
-        signer
-      );
-      // approve token to vault
-      const allowance = await token.allowance(
-        await signer.getAddress(),
-        PAYROLL_VAULT_ADDRESS
-      );
-      if (allowance < amountBn) {
-        const approveTx = await token.approve(PAYROLL_VAULT_ADDRESS, amountBn);
-        setStatus("Approving token tx: " + approveTx.hash);
-        await approveTx.wait();
+  const assignEmployeeHandler = useCallback(
+    async (e?: React.FormEvent) => {
+      e?.preventDefault?.();
+      addLog({
+        level: "debug",
+        action: "AssignEmployee_clicked",
+        message: "Assign button clicked",
+        meta: { assignAddr, assignSalary, assignCadence, assignLastPaid },
+      });
+      if (!validateAssignForm()) {
+        addLog({
+          level: "error",
+          action: "AssignEmployee_validate",
+          message: "validation failed",
+          meta: assignErrors,
+        });
+        showAlert("error", "Please fix validation errors before submitting.");
+        return;
       }
-      const tx = await vault.depositPayroll(depositPeriodId, amountBn);
-      setStatus("Deposit tx: " + tx.hash);
-      await tx.wait();
-      setStatus("Deposit complete");
-      await fetchEvents();
-    } catch (err: any) {
-      console.error(err);
-      setStatus("Error: " + (err?.message || String(err)));
-    }
-  }
+      setStatus("Assigning employee...");
+      try {
+        if (!(wallet && (wallet as any).provider)) {
+          addLog({
+            level: "info",
+            action: "AssignEmployee_connect",
+            message: "Wallet not connected; prompting connect",
+          });
+          await wallet?.connect?.();
+          if (!(wallet && (wallet as any).provider))
+            throw new Error("Wallet connection required for admin actions.");
+        }
+        if (!SALARY_SCHEDULE_ADDRESS)
+          throw new Error("SalarySchedule contract address not configured.");
+        const signer = await (wallet as any).provider.getSigner();
+        const schedule = getSalaryScheduleContract(signer);
+        const amt = await parseTokenAmount(
+          assignSalary,
+          STABLECOIN_ADDRESS,
+          signer
+        );
+        addLog({
+          level: "info",
+          action: "AssignEmployee_tx",
+          message: "sending assignEmployee transaction",
+          meta: { to: assignAddr, amount: assignSalary },
+        });
+        const tx = await schedule.assignEmployee(
+          assignAddr,
+          amt,
+          assignCadence,
+          assignLastPaid
+        );
+        showAlert("info", `Transaction sent: ${tx.hash}`);
+        addLog({
+          level: "debug",
+          action: "AssignEmployee_tx_sent",
+          message: "txSent",
+          meta: tx.hash,
+        });
+        await tx.wait();
+        addLog({
+          level: "info",
+          action: "AssignEmployee_tx_mined",
+          message: "tx mined",
+          meta: tx.hash,
+        });
+        setStatus("Employee assigned successfully.");
+        showAlert("success", "Employee assigned.");
+        await refreshEmployee(assignAddr);
+      } catch (err) {
+        handleActionError("AssignEmployee", err);
+      }
+    },
+    [
+      addLog,
+      assignAddr,
+      assignSalary,
+      assignCadence,
+      assignLastPaid,
+      validateAssignForm,
+      assignErrors,
+      wallet,
+      handleActionError,
+    ]
+  );
 
-  async function triggerHandler(e: React.FormEvent) {
-    e.preventDefault();
-    setStatus("Triggering salary due...");
-    try {
-      if (!wallet || !wallet.provider) throw new Error("Connect wallet first");
-      const signer = await wallet.provider.getSigner();
-      const schedule = getSalaryScheduleContract(signer);
-      const tx = await schedule.triggerSalaryDue(
-        triggerEmployee,
-        triggerPeriodId
-      );
-      setStatus("Trigger tx: " + tx.hash);
-      await tx.wait();
-      setStatus("SalaryDue triggered successfully");
-      await fetchEvents();
-    } catch (err: any) {
-      console.error(err);
-      setStatus("Error: " + (err?.message || String(err)));
-    }
-  }
+  const depositHandler = useCallback(
+    async (e?: React.FormEvent) => {
+      e?.preventDefault?.();
+      addLog({
+        level: "debug",
+        action: "Deposit_clicked",
+        message: "Deposit button clicked",
+        meta: { depositPeriodId, depositAmount },
+      });
+      if (!validateDepositForm()) {
+        addLog({
+          level: "error",
+          action: "Deposit_validate",
+          message: "validation failed",
+          meta: depositErrors,
+        });
+        showAlert("error", "Please fix deposit form errors.");
+        return;
+      }
+      setStatus("Depositing payroll...");
+      try {
+        if (!(wallet && (wallet as any).provider)) {
+          addLog({
+            level: "info",
+            action: "Deposit_connect",
+            message: "Wallet not connected; prompting connect",
+          });
+          await wallet?.connect?.();
+          if (!(wallet && (wallet as any).provider))
+            throw new Error("Wallet connection required for admin actions.");
+        }
+        if (!STABLECOIN_ADDRESS)
+          throw new Error("Stablecoin token address not configured.");
+        if (!PAYROLL_VAULT_ADDRESS)
+          throw new Error("PayrollVault contract address not configured.");
+        const signer = await (wallet as any).provider.getSigner();
+        const token = getStablecoinContract(STABLECOIN_ADDRESS, signer);
+        const vault = getPayrollVaultContract(signer);
+        const amountBn = await parseTokenAmount(
+          depositAmount,
+          STABLECOIN_ADDRESS,
+          signer
+        );
+
+        // Check allowance first and request approve only if needed
+        const ownerAddr = await signer.getAddress();
+        const allowance = await token.allowance(
+          ownerAddr,
+          PAYROLL_VAULT_ADDRESS
+        );
+        if (BigInt(allowance.toString()) < BigInt(amountBn.toString())) {
+          addLog({
+            level: "info",
+            action: "Deposit_approve",
+            message: "Approving token",
+            meta: { amount: depositAmount },
+          });
+          const approveTx = await token.approve(
+            PAYROLL_VAULT_ADDRESS,
+            amountBn
+          );
+          showAlert("info", `Approve tx sent: ${approveTx.hash}`);
+          await approveTx.wait();
+          addLog({
+            level: "debug",
+            action: "Deposit_approve_mined",
+            message: "approve mined",
+            meta: approveTx.hash,
+          });
+        }
+
+        const tx = await vault.depositPayroll(
+          Number(depositPeriodId),
+          amountBn
+        );
+        showAlert("info", `Deposit tx sent: ${tx.hash}`);
+        addLog({
+          level: "info",
+          action: "Deposit_tx",
+          message: "deposit sent",
+          meta: tx.hash,
+        });
+        await tx.wait();
+        addLog({
+          level: "info",
+          action: "Deposit_mined",
+          message: "deposit mined",
+          meta: tx.hash,
+        });
+        setStatus("Deposit successful.");
+        showAlert("success", "Deposit successful.");
+        await fetchEvents();
+      } catch (err) {
+        handleActionError("Deposit", err);
+      }
+    },
+    [
+      addLog,
+      depositPeriodId,
+      depositAmount,
+      validateDepositForm,
+      depositErrors,
+      wallet,
+      handleActionError,
+      fetchEvents,
+    ]
+  );
+
+  const triggerHandler = useCallback(
+    async (e?: React.FormEvent) => {
+      e?.preventDefault?.();
+      addLog({
+        level: "debug",
+        action: "Trigger_clicked",
+        message: "Trigger button clicked",
+        meta: { triggerEmployee, triggerPeriodId },
+      });
+      if (!validateTriggerForm()) {
+        addLog({
+          level: "error",
+          action: "Trigger_validate",
+          message: "validation failed",
+          meta: triggerErrors,
+        });
+        showAlert("error", "Please fix trigger form errors.");
+        return;
+      }
+      setStatus("Triggering salary due...");
+      try {
+        if (!(wallet && (wallet as any).provider)) {
+          addLog({
+            level: "info",
+            action: "Trigger_connect",
+            message: "Wallet not connected; prompting connect",
+          });
+          await wallet?.connect?.();
+          if (!(wallet && (wallet as any).provider))
+            throw new Error("Wallet connection required for admin actions.");
+        }
+        if (!SALARY_SCHEDULE_ADDRESS)
+          throw new Error("SalarySchedule contract address not configured.");
+        const signer = await (wallet as any).provider.getSigner();
+        const schedule = getSalaryScheduleContract(signer);
+        const tx = await schedule.triggerSalaryDue(
+          triggerEmployee,
+          Number(triggerPeriodId)
+        );
+        showAlert("info", `Trigger tx sent: ${tx.hash}`);
+        addLog({
+          level: "info",
+          action: "Trigger_tx",
+          message: "trigger sent",
+          meta: tx.hash,
+        });
+        await tx.wait();
+        addLog({
+          level: "info",
+          action: "Trigger_mined",
+          message: "trigger mined",
+          meta: tx.hash,
+        });
+        setStatus("Triggered SalaryDue.");
+        showAlert("success", "SalaryDue triggered.");
+        await fetchEvents();
+      } catch (err) {
+        handleActionError("Trigger", err);
+      }
+    },
+    [
+      addLog,
+      triggerEmployee,
+      triggerPeriodId,
+      validateTriggerForm,
+      triggerErrors,
+      wallet,
+      handleActionError,
+      fetchEvents,
+    ]
+  );
 
   /* ===========================
      Lookup & Claim viewer
      =========================== */
-
-  async function refreshEmployee(address?: string) {
-    const addr = address || lookupAddress;
-    if (!addr) return;
-    setStatus("Fetching employee info...");
-    try {
-      const provider = getJsonRpcProvider();
-      const schedule = getSalaryScheduleContract(provider);
-      const info: [ethers.BigNumberish, number, ethers.BigNumberish, boolean] =
-        await schedule.getEmployee(addr);
-      const salary = info[0].toString();
-      const cadence = Number(info[1]);
-      const lastPaid = Number(info[2]?.toString() || "0");
-      const exists = Boolean(info[3]);
-      setEmployeeInfo({
-        salary: salary,
-        cadence,
-        lastPaid,
-        exists,
-      });
-      // next expected period
+  const refreshEmployee = useCallback(
+    async (address?: string) => {
+      const addr = address || lookupAddress;
+      if (!addr) {
+        setLookupError("Please provide an employee address to lookup.");
+        return;
+      }
+      if (!isValidAddress(addr)) {
+        setLookupError("Invalid address format.");
+        return;
+      }
+      setLookupError(null);
+      setStatus("Fetching employee info...");
       try {
-        const np: ethers.BigNumberish = await schedule.nextExpectedPeriod(addr);
-        setNextPeriod(Number(np.toString()));
-      } catch {
+        const provider = getReadProvider();
+        const schedule = getSalaryScheduleContract(provider);
+
+        const code = await provider.getCode(SALARY_SCHEDULE_ADDRESS);
+        if (code === "0x")
+          throw new Error(
+            "SalarySchedule contract not found at configured address. Check network and contract address."
+          );
+
+        const info: [
+          ethers.BigNumberish,
+          number,
+          ethers.BigNumberish,
+          boolean
+        ] = await schedule.getEmployee(addr);
+        const salary = info[0].toString();
+        const cadence = Number(info[1]);
+        const lastPaid = Number(info[2]?.toString() || "0");
+        const exists = Boolean(info[3]);
+
+        if (!exists) {
+          setLookupError(
+            "Employee not found. This address has not been assigned."
+          );
+          setEmployeeInfo(null);
+          setNextPeriod(null);
+          setStatus("Employee not found");
+          addLog({
+            level: "info",
+            action: "RefreshEmployee",
+            message: "employee not found",
+            meta: { addr },
+          });
+          return;
+        }
+
+        setEmployeeInfo({ salary, cadence, lastPaid, exists });
+
+        try {
+          const np: ethers.BigNumberish = await schedule.nextExpectedPeriod(
+            addr
+          );
+          setNextPeriod(Number(np.toString()));
+        } catch {
+          setNextPeriod(null);
+        }
+        setStatus("Employee info fetched");
+        addLog({
+          level: "info",
+          action: "RefreshEmployee",
+          message: "employee info fetched",
+          meta: { addr },
+        });
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        if (msg.includes("could not decode result data")) {
+          setLookupError(
+            "Employee not found or contract error. Verify the address is assigned and you're on the correct network."
+          );
+        } else setLookupError(msg);
+        addLog({
+          level: "error",
+          action: "RefreshEmployee_failed",
+          message: msg,
+          meta: err,
+        });
+        setStatus("Error fetching employee info: " + msg);
+        setEmployeeInfo(null);
         setNextPeriod(null);
       }
-      setStatus("Employee info fetched");
-    } catch (err: any) {
-      console.error(err);
-      setStatus(
-        "Error fetching employee info: " + (err?.message || String(err))
-      );
-      setEmployeeInfo(null);
-      setNextPeriod(null);
-    }
-  }
+    },
+    [lookupAddress, getReadProvider, addLog]
+  );
 
-  function buildX402Body(addr: string) {
-    if (!employeeInfo) return null;
-    return {
-      to: addr,
-      amount: employeeInfo.salary,
-      token: STABLECOIN_ADDRESS,
-      periodId: nextPeriod ?? Math.floor(Date.now() / 1000),
-      meta: {
-        cadence: employeeInfo.cadence,
-        lastPaid: employeeInfo.lastPaid,
-      },
-    };
-  }
+  const buildX402Body = useCallback(
+    (addr: string) => {
+      if (!employeeInfo) return null;
+      return {
+        to: addr,
+        amount: employeeInfo.salary,
+        token: STABLECOIN_ADDRESS,
+        periodId: nextPeriod ?? Math.floor(Date.now() / 1000),
+        meta: {
+          cadence: employeeInfo.cadence,
+          lastPaid: employeeInfo.lastPaid,
+        },
+      };
+    },
+    [employeeInfo, nextPeriod]
+  );
 
-  async function simulateFacilitatorForClaim(addr: string) {
-    if (!addr) return;
-    setStatus("Simulating facilitator payment...");
-    try {
+  const simulateFacilitatorForClaim = useCallback(
+    async (addr: string) => {
+      addLog({
+        level: "debug",
+        action: "SimulateFacilitator_clicked",
+        message: "clicked simulate",
+        meta: { addr },
+      });
+      if (!addr) {
+        showAlert("error", "Employee address required for simulation.");
+        return null;
+      }
       const x402 = buildX402Body(addr);
-      if (!x402) throw new Error("No x402 data");
-      // call backend simulate endpoint
-      const backend = process.env.NEXT_PUBLIC_BACKEND_URL || DEFAULT_BACKEND;
-      const url = `${backend.replace(/\/$/, "")}/simulate-facilitator`;
-      // we post the raw x402 body for the backend to create a mock proof
-      const resp = await axios.post(url, { x402 });
-      setStatus(
-        "Simulator response: " +
-          (resp.data?.proof ? "proof generated" : JSON.stringify(resp.data))
-      );
-      return resp.data;
-    } catch (err: any) {
-      console.error(err);
-      setStatus("Simulator error: " + (err?.message || String(err)));
-      return null;
-    }
-  }
+      if (!x402) {
+        showAlert(
+          "error",
+          "No x402 payload available. Fetch employee info first."
+        );
+        return null;
+      }
+      setStatus("Simulating facilitator payment...");
+      try {
+        const backend = process.env.NEXT_PUBLIC_BACKEND_URL || DEFAULT_BACKEND;
+        const url = `${backend.replace(/\/$/, "")}/simulate-facilitator`;
+        const resp = await axios.post(url, { x402 });
+        addLog({
+          level: "info",
+          action: "SimulateFacilitator",
+          message: "simulator returned",
+          meta: resp.data,
+        });
+        showAlert("success", "Simulator proof generated.");
+        return resp.data;
+      } catch (err: any) {
+        addLog({
+          level: "error",
+          action: "SimulateFacilitator_failed",
+          message: err?.message || String(err),
+          meta: err,
+        });
+        showAlert(
+          "error",
+          "Simulator failed: " + (err?.message || "network error")
+        );
+        return null;
+      } finally {
+        setStatus(null);
+      }
+    },
+    [addLog, buildX402Body, showAlert]
+  );
 
   /* ===========================
-     Helpers
-     =========================== */
-
-  async function parseTokenInput(
-    human: string,
-    tokenAddr: string,
-    providerOrSigner?: any
-  ) {
-    // parse using token decimals if possible
-    try {
-      const token = getStablecoinContract(
-        tokenAddr,
-        providerOrSigner ?? getJsonRpcProvider()
-      );
-      const decimals = Number(await token.decimals());
-      return ethers.parseUnits(human, decimals);
-    } catch {
-      // default to 6 decimals (USDC)
-      return ethers.parseUnits(human, 6);
-    }
-  }
-
-  /* ===========================
-     UI render
+     Render
      =========================== */
 
   return (
@@ -324,71 +702,128 @@ export default function Dashboard() {
       </Head>
 
       <div className="container mx-auto">
-        <h1 className="text-3xl font-bold mb-3">
-          BlockWage — Employer Dashboard
-        </h1>
-        <p className="muted mb-6">
-          Connected:{" "}
-          <span className="mono">
-            {wallet.address ? short(wallet.address) : "Not connected"}
-          </span>
-        </p>
+        <header className="flex items-center justify-between py-4">
+          <div>
+            <h1 className="text-3xl font-bold">
+              BlockWage — Employer Dashboard
+            </h1>
+            <p className="muted">
+              Manage payroll, assign employees, and trigger pay
+            </p>
+          </div>
+          <div className="text-right">
+            <div className="muted">
+              RPC:{" "}
+              {process.env.NEXT_PUBLIC_RPC_URL || "Cronos testnet (default)"}
+            </div>
+            <div className="mono mt-1">
+              {(wallet as any)?.address
+                ? short((wallet as any).address)
+                : "Not connected"}
+            </div>
+          </div>
+        </header>
+
+        {/* Alert */}
+        {alert && (
+          <div
+            className={clsx(
+              "p-3 rounded mb-4",
+              alert.type === "error"
+                ? "bg-red-50 text-red-700"
+                : alert.type === "success"
+                ? "bg-green-50 text-green-700"
+                : "bg-blue-50 text-blue-700"
+            )}
+          >
+            {alert.text}
+          </div>
+        )}
 
         <div className="grid md:grid-cols-2 gap-6">
-          {/* Left: Admin forms */}
-          <div className="card">
+          <section className="card">
             <h2 className="text-xl font-semibold mb-2">Assign Employee</h2>
-            <form onSubmit={assignEmployeeHandler} className="space-y-3">
-              <label className="block">
-                <div className="label">Employee address</div>
+            <form
+              onSubmit={(e) => assignEmployeeHandler(e)}
+              className="space-y-3"
+            >
+              <div>
+                <label className="label">Employee address</label>
                 <input
+                  className={clsx(
+                    "input w-full border rounded px-3 py-2",
+                    assignErrors.addr && "border-red-400"
+                  )}
                   value={assignAddr}
                   onChange={(e) => setAssignAddr(e.target.value)}
-                  placeholder="0x..."
-                  className="input w-full border rounded-md px-3 py-2"
                 />
-              </label>
+                {assignErrors.addr && (
+                  <div className="text-sm text-red-600 mt-1">
+                    {assignErrors.addr}
+                  </div>
+                )}
+              </div>
 
-              <label className="block">
-                <div className="label">Salary (in token units e.g. USDC)</div>
+              <div>
+                <label className="label">Salary (token units)</label>
                 <input
+                  className={clsx(
+                    "input w-full border rounded px-3 py-2",
+                    assignErrors.salary && "border-red-400"
+                  )}
                   value={assignSalary}
                   onChange={(e) => setAssignSalary(e.target.value)}
-                  placeholder="1.0"
-                  className="input w-full border rounded-md px-3 py-2"
                 />
-              </label>
+                {assignErrors.salary && (
+                  <div className="text-sm text-red-600 mt-1">
+                    {assignErrors.salary}
+                  </div>
+                )}
+              </div>
 
-              <label className="block">
-                <div className="label">Cadence</div>
-                <select
-                  value={assignCadence}
-                  onChange={(e) => setAssignCadence(Number(e.target.value))}
-                  className="input w-full border rounded-md px-3 py-2"
-                >
-                  <option value={2}>Monthly</option>
-                  <option value={1}>Biweekly</option>
-                  <option value={0}>Hourly</option>
-                </select>
-              </label>
-
-              <label className="block">
-                <div className="label">
-                  Initial last paid timestamp (optional)
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <label className="label">Cadence</label>
+                  <select
+                    className="input w-full border rounded px-3 py-2"
+                    value={assignCadence}
+                    onChange={(e) => setAssignCadence(Number(e.target.value))}
+                  >
+                    <option value={2}>Monthly</option>
+                    <option value={1}>Biweekly</option>
+                    <option value={0}>Hourly</option>
+                  </select>
+                  {assignErrors.cadence && (
+                    <div className="text-sm text-red-600 mt-1">
+                      {assignErrors.cadence}
+                    </div>
+                  )}
                 </div>
-                <input
-                  type="number"
-                  value={assignLastPaid}
-                  onChange={(e) => setAssignLastPaid(Number(e.target.value))}
-                  className="input w-full border rounded-md px-3 py-2"
-                />
-              </label>
 
-              <div className="flex items-center space-x-3">
+                <div style={{ minWidth: 180 }}>
+                  <label className="label">Initial lastPaid (unix)</label>
+                  <input
+                    type="number"
+                    className={clsx(
+                      "input w-full border rounded px-3 py-2",
+                      assignErrors.lastPaid && "border-red-400"
+                    )}
+                    value={assignLastPaid}
+                    onChange={(e) => setAssignLastPaid(Number(e.target.value))}
+                  />
+                  {assignErrors.lastPaid && (
+                    <div className="text-sm text-red-600 mt-1">
+                      {assignErrors.lastPaid}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3 mt-2">
                 <button
-                  className="btn btn-primary"
                   type="submit"
-                  disabled={!wallet.address}
+                  className="btn btn-primary"
+                  disabled={!(wallet as any)?.address}
                 >
                   Assign employee
                 </button>
@@ -399,50 +834,69 @@ export default function Dashboard() {
                     setAssignAddr("");
                     setAssignSalary("1");
                     setAssignLastPaid(0);
+                    setAssignErrors({});
                   }}
                 >
                   Reset
                 </button>
               </div>
             </form>
-          </div>
+          </section>
 
-          <div className="card">
-            <h2 className="text-xl font-semibold mb-2">Deposit Payroll</h2>
-            <form onSubmit={depositHandler} className="space-y-3">
-              <label>
-                <div className="label">Period ID (numeric)</div>
+          <section className="card">
+            <h2 className="text-xl font-semibold mb-2">Funding & Trigger</h2>
+
+            <form onSubmit={(e) => depositHandler(e)} className="space-y-3">
+              <div>
+                <label className="label">Period ID (unix integer)</label>
                 <input
-                  type="number"
                   value={depositPeriodId}
-                  onChange={(e) => setDepositPeriodId(Number(e.target.value))}
-                  className="input w-full border rounded-md px-3 py-2"
+                  onChange={(e) => setDepositPeriodId(e.target.value)}
+                  className={clsx(
+                    "input w-full border rounded px-3 py-2",
+                    depositErrors.periodId && "border-red-400"
+                  )}
                 />
-              </label>
+                {depositErrors.periodId && (
+                  <div className="text-sm text-red-600 mt-1">
+                    {depositErrors.periodId}
+                  </div>
+                )}
+              </div>
 
-              <label>
-                <div className="label">Amount</div>
+              <div>
+                <label className="label">Amount</label>
                 <input
                   value={depositAmount}
                   onChange={(e) => setDepositAmount(e.target.value)}
-                  className="input w-full border rounded-md px-3 py-2"
+                  className={clsx(
+                    "input w-full border rounded px-3 py-2",
+                    depositErrors.amount && "border-red-400"
+                  )}
                 />
-              </label>
+                {depositErrors.amount && (
+                  <div className="text-sm text-red-600 mt-1">
+                    {depositErrors.amount}
+                  </div>
+                )}
+              </div>
 
-              <div className="flex items-center space-x-3">
+              <div className="flex items-center gap-3">
                 <button
-                  className="btn btn-primary"
                   type="submit"
-                  disabled={!wallet.address}
+                  className="btn btn-primary"
+                  disabled={!(wallet as any)?.address}
                 >
-                  Deposit
+                  Deposit for period
                 </button>
+
                 <button
                   type="button"
                   className="btn btn-ghost"
                   onClick={() => {
                     setDepositAmount("1");
-                    setDepositPeriodId(Math.floor(Date.now() / 1000));
+                    setDepositPeriodId(String(Math.floor(Date.now() / 1000)));
+                    setDepositErrors({});
                   }}
                 >
                   Reset
@@ -452,202 +906,183 @@ export default function Dashboard() {
 
             <div className="hr my-4" />
 
-            <h3 className="font-semibold">Trigger Salary Due</h3>
-            <form onSubmit={triggerHandler} className="space-y-3 mt-3">
-              <input
-                placeholder="Employee address to trigger"
-                value={triggerEmployee}
-                onChange={(e) => setTriggerEmployee(e.target.value)}
-                className="input w-full border rounded-md px-3 py-2"
-              />
-              <input
-                type="number"
-                value={triggerPeriodId}
-                onChange={(e) => setTriggerPeriodId(Number(e.target.value))}
-                className="input w-full border rounded-md px-3 py-2"
-              />
+            <form onSubmit={(e) => triggerHandler(e)} className="space-y-3">
+              <div>
+                <label className="label">Employee address to trigger</label>
+                <input
+                  className={clsx(
+                    "input w-full border rounded px-3 py-2",
+                    triggerErrors.employee && "border-red-400"
+                  )}
+                  value={triggerEmployee}
+                  onChange={(e) => setTriggerEmployee(e.target.value)}
+                />
+                {triggerErrors.employee && (
+                  <div className="text-sm text-red-600 mt-1">
+                    {triggerErrors.employee}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="label">Period ID</label>
+                <input
+                  className={clsx(
+                    "input w-full border rounded px-3 py-2",
+                    triggerErrors.periodId && "border-red-400"
+                  )}
+                  value={triggerPeriodId}
+                  onChange={(e) => setTriggerPeriodId(e.target.value)}
+                />
+                {triggerErrors.periodId && (
+                  <div className="text-sm text-red-600 mt-1">
+                    {triggerErrors.periodId}
+                  </div>
+                )}
+              </div>
+
               <div>
                 <button
-                  className="btn btn-primary"
                   type="submit"
-                  disabled={!wallet.address}
+                  className="btn btn-primary"
+                  disabled={!(wallet as any)?.address}
                 >
                   Trigger SalaryDue
                 </button>
               </div>
             </form>
-          </div>
+          </section>
         </div>
 
-        {/* Lookup / Claim viewer */}
-        <div className="card mt-6">
+        {/* Lookup */}
+        <section className="card mt-6">
           <h2 className="text-xl font-semibold mb-2">
             Employee lookup & Claim viewer
           </h2>
-          <div className="grid md:grid-cols-3 gap-3">
-            <div>
-              <input
-                placeholder="Enter employee address"
-                value={lookupAddress}
-                onChange={(e) => setLookupAddress(e.target.value)}
-                className="input w-full border rounded-md px-3 py-2"
-              />
-            </div>
-            <div>
-              <button
-                onClick={() => refreshEmployee()}
-                className="btn btn-primary"
-                disabled={!lookupAddress}
-              >
-                Fetch Employee
-              </button>
-            </div>
-            <div>
-              <button
-                onClick={async () => {
-                  if (!lookupAddress) return;
-                  const resp = await simulateFacilitatorForClaim(lookupAddress);
-                  // optionally auto-call backend verify here for demo
-                  console.log("simulateFacilitatorForClaim returned", resp);
-                }}
-                className="btn btn-ghost"
-                disabled={!lookupAddress}
-              >
-                Simulate Facilitator (demo)
-              </button>
-            </div>
+          <div className="flex gap-3 mb-3">
+            <input
+              placeholder="0x..."
+              value={lookupAddress}
+              onChange={(e) => setLookupAddress(e.target.value)}
+              className="input flex-1 border rounded px-3 py-2"
+            />
+            <button
+              className="btn btn-primary"
+              onClick={() => {
+                addLog({
+                  level: "debug",
+                  action: "FetchEmployee_clicked",
+                  message: "click",
+                });
+                refreshEmployee();
+              }}
+              disabled={!lookupAddress}
+            >
+              Fetch Employee
+            </button>
+            <button
+              className="btn btn-ghost"
+              onClick={() => {
+                addLog({
+                  level: "debug",
+                  action: "SimulateFromLookup_clicked",
+                  message: "click",
+                });
+                simulateFacilitatorForClaim(lookupAddress);
+              }}
+              disabled={!lookupAddress}
+            >
+              Simulate Facilitator
+            </button>
           </div>
 
-          <div className="mt-4">
-            {employeeInfo ? (
-              <div>
-                <div className="flex items-center justify-between">
+          {lookupError && (
+            <div className="text-sm text-red-600 mb-3">{lookupError}</div>
+          )}
+
+          {employeeInfo ? (
+            <div>
+              <div className="grid md:grid-cols-3 gap-3">
+                <div>
+                  <div className="label">Employee</div>
+                  <div className="mono">{lookupAddress}</div>
+                </div>
+                <div>
+                  <div className="label">Assigned salary (raw)</div>
+                  <div className="mono">{employeeInfo.salary}</div>
+                </div>
+                <div>
+                  <div className="label">Next Period</div>
                   <div>
-                    <div className="label">Employee</div>
+                    {nextPeriod
+                      ? new Date(nextPeriod * 1000).toISOString()
+                      : "unknown"}
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 x402-instructions">
+                <div className="grid md:grid-cols-2 gap-2">
+                  <div>
+                    <div className="label">to</div>
                     <div className="mono">{lookupAddress}</div>
                   </div>
-                  <div className="text-right">
-                    <div className="label">Assigned salary (raw)</div>
+                  <div>
+                    <div className="label">token</div>
+                    <div className="mono">
+                      {STABLECOIN_ADDRESS || "not-configured"}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="label">amount (raw)</div>
                     <div className="mono">{employeeInfo.salary}</div>
                   </div>
-                </div>
-
-                <div className="mt-3 grid md:grid-cols-3 gap-3">
                   <div>
-                    <div className="label">Cadence</div>
-                    <div>
-                      {employeeInfo.cadence === 2
-                        ? "Monthly"
-                        : employeeInfo.cadence === 1
-                        ? "Biweekly"
-                        : "Hourly"}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="label">Last Paid (unix)</div>
-                    <div>{employeeInfo.lastPaid || "never"}</div>
-                  </div>
-                  <div>
-                    <div className="label">Next Period</div>
-                    <div>
-                      {nextPeriod
-                        ? new Date(nextPeriod * 1000).toISOString()
-                        : "unknown"}
+                    <div className="label">periodId</div>
+                    <div className="mono">
+                      {nextPeriod ?? Math.floor(Date.now() / 1000)}
                     </div>
                   </div>
                 </div>
 
-                <div className="mt-4">
-                  <h3 className="font-semibold">x402 Claim Preview</h3>
-                  <div className="x402-instructions mt-2">
-                    <div className="grid md:grid-cols-2 gap-2">
-                      <div>
-                        <div className="label">to</div>
-                        <div className="mono">{lookupAddress}</div>
-                      </div>
-                      <div>
-                        <div className="label">token</div>
-                        <div className="mono">
-                          {STABLECOIN_ADDRESS || "not-configured"}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="label">amount (raw)</div>
-                        <div className="mono">{employeeInfo.salary}</div>
-                      </div>
-                      <div>
-                        <div className="label">periodId</div>
-                        <div className="mono">
-                          {nextPeriod ?? Math.floor(Date.now() / 1000)}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="mt-3 flex items-center gap-3">
-                      <a
-                        className={clsx("btn btn-primary")}
-                        href={`/employee/${lookupAddress}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Open Claim Page
-                      </a>
-
-                      <button
-                        className="btn btn-ghost"
-                        onClick={async () => {
-                          // open a simple popup with JSON body for 402 (client-side)
-                          const body = buildX402Body(lookupAddress);
-                          if (!body) return;
-                          const w = window.open(
-                            "",
-                            "_blank",
-                            "width=600,height=600"
-                          );
-                          if (!w) return;
-                          w.document.body.style.fontFamily =
-                            "Inter, system-ui, sans-serif";
-                          w.document.title = `Claim — ${short(lookupAddress)}`;
-                          w.document.body.innerHTML = `
-                            <div style="padding:20px">
-                              <h2>402 Payment Required (x402)</h2>
-                              <pre style="background:#f3f4f6;padding:12px;border-radius:8px">${JSON.stringify(
-                                body,
-                                null,
-                                2
-                              )}</pre>
-                              <p>Use a facilitator to pay the requested amount. For demo, use the backend simulate endpoint.</p>
-                            </div>
-                          `;
-                        }}
-                      >
-                        Preview 402 JSON
-                      </button>
-                    </div>
-                  </div>
+                <div className="mt-3">
+                  <p className="muted">
+                    Use a facilitator to perform the payment and then POST the
+                    proof to your backend /salary/verify endpoint to finalize
+                    on-chain release.
+                  </p>
                 </div>
               </div>
-            ) : (
-              <div className="muted">
-                No employee loaded. Enter an address and click &quot;Fetch
-                Employee&quot;.
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Events & status */}
-        <div className="card mt-6">
-          <div className="flex items-center justify-between">
-            <h2 className="text-xl font-semibold">Recent SalaryDue Events</h2>
-            <div className="flex items-center gap-2">
-              <button className="btn btn-ghost" onClick={() => fetchEvents()}>
-                Refresh
-              </button>
             </div>
-          </div>
+          ) : (
+            <div className="muted">
+              No employee loaded. Enter an address and click "Fetch Employee".
+            </div>
+          )}
+        </section>
 
-          <div className="mt-3">
+        {/* Events & logs */}
+        <div className="grid md:grid-cols-2 gap-6 mt-6">
+          <section className="card">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-semibold">Recent SalaryDue Events</h3>
+              <div>
+                <button
+                  className="btn btn-ghost mr-2"
+                  onClick={() => {
+                    fetchEvents();
+                    addLog({
+                      level: "debug",
+                      action: "EventsRefresh_clicked",
+                      message: "manual refresh",
+                    });
+                  }}
+                >
+                  Refresh
+                </button>
+              </div>
+            </div>
+
             {loadingEvents ? (
               <div>Loading events...</div>
             ) : events.length === 0 ? (
@@ -657,8 +1092,7 @@ export default function Dashboard() {
                 <thead>
                   <tr>
                     <th>Employee</th>
-                    <th>Amount (raw)</th>
-                    <th>Token</th>
+                    <th>Amount</th>
                     <th>Period</th>
                     <th>Tx</th>
                     <th>Block</th>
@@ -669,14 +1103,13 @@ export default function Dashboard() {
                     <tr key={idx}>
                       <td className="mono">{ev.employee}</td>
                       <td className="mono">{ev.amount}</td>
-                      <td className="mono">{ev.token}</td>
                       <td className="mono">{ev.periodId}</td>
                       <td>
                         <a
-                          href={`https://testnet.cronoscan.com/tx/${ev.txHash}`}
+                          className="mono underline"
                           target="_blank"
                           rel="noreferrer"
-                          className="mono underline"
+                          href={`https://testnet.cronoscan.com/tx/${ev.txHash}`}
                         >
                           {short(ev.txHash)}
                         </a>
@@ -687,23 +1120,57 @@ export default function Dashboard() {
                 </tbody>
               </table>
             )}
-          </div>
+          </section>
+
+          <section className="card">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-semibold">Action Log</h3>
+              <div className="muted text-sm">{logs.length} recent</div>
+            </div>
+
+            <div style={{ maxHeight: 380, overflow: "auto" }}>
+              <ul className="text-sm space-y-2">
+                {logs.map((l, idx) => (
+                  <li
+                    key={idx}
+                    className={clsx(
+                      "p-2 rounded",
+                      l.level === "error"
+                        ? "bg-red-50 text-red-700"
+                        : l.level === "debug"
+                        ? "bg-slate-50 text-slate-800"
+                        : "bg-green-50 text-green-700"
+                    )}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="mono">
+                          {new Date(l.ts).toLocaleString()}
+                        </div>
+                        <div className="font-semibold">{l.action}</div>
+                        {l.message && <div className="muted">{l.message}</div>}
+                      </div>
+                      <div className="text-xs mono">{l.level}</div>
+                    </div>
+                    {l.meta && (
+                      <pre className="mt-2 p-2 bg-white rounded text-xs overflow-x-auto">
+                        {JSON.stringify(l.meta, null, 2)}
+                      </pre>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <div className="mt-2 flex gap-2">
+              <button className="btn btn-ghost" onClick={() => clearLogs()}>
+                Clear logs
+              </button>
+            </div>
+          </section>
         </div>
 
-        {/* Status footer */}
-        <div className="mt-4">
-          <div className="muted">Status: {status ?? "idle"}</div>
-        </div>
+        <div className="mt-6 muted">Status: {status ?? "idle"}</div>
       </div>
     </>
   );
 }
-
-/* =========================
-   Note: For a production-ready frontend we would:
-   - Add the dynamic route at /pages/employee/[address].tsx that returns actual 402 status via Next API or serverless function,
-   - Implement the API route pages/api/claim/[address].ts to respond with HTTP 402 & x402 JSON (server-side),
-   - Integrate with the backend /simulate-facilitator endpoint (server-side) which creates facilitator proofs for demo,
-   - Add robust error handling, pagination for events, and improved UX flows.
-   The Dashboard here includes a claim preview and Open Claim Page link for demo/testing.
-   ========================= */

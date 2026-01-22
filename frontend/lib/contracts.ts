@@ -22,7 +22,7 @@ import { ethers } from "ethers";
    Environment-driven addresses
    ========================= */
 export const RPC_URL =
-  process.env.NEXT_PUBLIC_RPC_URL || "http://localhost:8545";
+  process.env.NEXT_PUBLIC_RPC_URL || "https://evm-t3.cronos.org";
 export const SALARY_SCHEDULE_ADDRESS =
   process.env.NEXT_PUBLIC_SALARY_SCHEDULE || "";
 export const PAYROLL_VAULT_ADDRESS =

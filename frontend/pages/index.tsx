@@ -47,13 +47,13 @@ import { useLogger } from "../lib/logger";
 
 type EmployeeInfo = {
   salary: string;
-  cadence: 0 | 1 | 2 | 3;
+  cadence: number; // 0 - 3
   lastPaid: number;
   exists: boolean;
 };
 
 const DEFAULT_BACKEND =
-  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3000";
+  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3001";
 
 /* Small helpers */
 const short = (addr?: string) =>
@@ -624,131 +624,6 @@ export default function Dashboard() {
     [lookupAddress, getReadProvider, addLog]
   );
 
-  const buildX402Body = useCallback(
-    (addr: string) => {
-      if (!employeeInfo) return null;
-      return {
-        to: addr,
-        amount: employeeInfo.salary,
-        token: STABLECOIN_ADDRESS,
-        periodId: nextPeriod ?? Math.floor(Date.now() / 1000),
-        meta: {
-          cadence: employeeInfo.cadence,
-          lastPaid: employeeInfo.lastPaid,
-        },
-      };
-    },
-    [employeeInfo, nextPeriod]
-  );
-
-  const simulateFacilitatorForClaim = useCallback(
-    async (addr: string) => {
-      if (!addr) {
-        showAlert("error", "Employee address required for simulation.");
-        return null;
-      }
-
-      const backend = process.env.NEXT_PUBLIC_BACKEND_URL || DEFAULT_BACKEND;
-      const baseUrl = backend.replace(/\/$/, "");
-
-      setStatus("Claiming salary...");
-      addLog({
-        level: "info",
-        action: "SimulateFacilitator",
-        message: "Starting claim flow",
-        meta: { addr },
-      });
-
-      try {
-        // Step 1: Claim salary (x402)
-        let x402: any;
-        try {
-          await axios.get(`${baseUrl}/salary/claim/${addr}`);
-        } catch (err: any) {
-          // Axios throws on 402
-          if (err.response?.status === 402 && err.response?.data?.x402) {
-            x402 = err.response.data.x402;
-            addLog({
-              level: "info",
-              action: "SalaryClaimed",
-              message: "Payment required received",
-              meta: x402,
-            });
-            showAlert("info", "Payment required; proceeding with simulator.");
-          } else {
-            throw err;
-          }
-        }
-
-        if (!x402) {
-          showAlert("error", "No x402 payload returned from claim.");
-          return null;
-        }
-
-        setStatus("Simulating facilitator...");
-        // Step 2: Call simulator
-        const simulateResp = await axios.post(
-          `${baseUrl}/simulate-facilitator`,
-          { x402 }
-        );
-        const facilitatorProof = simulateResp.data?.proof;
-        if (!facilitatorProof) {
-          showAlert("error", "Simulator did not return a proof.");
-          addLog({
-            level: "error",
-            action: "SimulateFacilitator",
-            message: "No proof returned",
-            meta: simulateResp.data,
-          });
-          return null;
-        }
-        addLog({
-          level: "info",
-          action: "SimulateFacilitator",
-          message: "Proof generated",
-          meta: { proofSnippet: facilitatorProof.slice(0, 20) },
-        });
-        showAlert("success", "Simulator proof generated.");
-
-        setStatus("Verifying salary...");
-        // Step 3: Verify
-        const verifyResp = await axios.post(`${baseUrl}/salary/verify`, {
-          facilitatorProof,
-          employee: addr,
-          periodId: x402.periodId,
-        });
-        addLog({
-          level: "info",
-          action: "SalaryVerified",
-          message: "Salary released successfully",
-          meta: verifyResp.data,
-        });
-        showAlert("success", "Salary verified and paid!");
-
-        return { x402, facilitatorProof, verifyResp: verifyResp.data };
-      } catch (err: any) {
-        addLog({
-          level: "error",
-          action: "SimulateFacilitator_failed",
-          message: err?.message || String(err),
-          meta: err,
-        });
-        showAlert(
-          "error",
-          "Simulator flow failed: " + (err?.message || "network error")
-        );
-        return null;
-      } finally {
-        setStatus(null);
-      }
-    },
-    [showAlert, addLog]
-  );
-
-  /* ===========================
-     Render
-     =========================== */
-
   return (
     <>
       <Head>
@@ -1035,20 +910,6 @@ export default function Dashboard() {
             >
               Fetch Employee
             </button>
-            <button
-              className="btn btn-ghost"
-              onClick={() => {
-                addLog({
-                  level: "debug",
-                  action: "SimulateFromLookup_clicked",
-                  message: "click",
-                });
-                simulateFacilitatorForClaim(lookupAddress);
-              }}
-              disabled={!lookupAddress}
-            >
-              Simulate Facilitator
-            </button>
           </div>
 
           {lookupError && (
@@ -1115,6 +976,24 @@ export default function Dashboard() {
             </div>
           )}
         </section>
+
+        {employeeInfo && (
+          <div className="mt-4 p-4 bg-blue-50 rounded-lg">
+            <h4 className="font-semibold mb-2">Payment Instructions</h4>
+            <ol className="list-decimal list-inside space-y-2 text-sm">
+              <li>
+                Employee visits:{" "}
+                <code className="bg-white px-2 py-1 rounded">
+                  GET backendUrl/salary/claim/{lookupAddress}
+                </code>
+              </li>
+              <li>Employee receives 402 Payment Required response</li>
+              <li>Employee signs EIP-3009 authorization with wallet</li>
+              <li>Cronos Facilitator executes gasless USDC transfer</li>
+              <li>Backend receives webhook and records payment</li>
+            </ol>
+          </div>
+        )}
 
         {/* Events & logs */}
         <div className="grid md:grid-cols-2 gap-6 mt-6">

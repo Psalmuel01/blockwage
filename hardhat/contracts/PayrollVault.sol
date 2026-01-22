@@ -1,73 +1,59 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
-/*
-  PayrollVault.sol - Vault for storing stablecoins (devUSDC.e) and releasing payroll settlements.
 
-  Responsibilities:
-  - Accept employer deposits per payroll period
-  - Map employees -> salary/cadence metadata (mirrors schedule)
-  - Release salary upon validation (checks schedule & verifier)
-  - Prevent double-pay
-  - Allow withdrawing excess/unreserved funds
-  - Integrate with SalarySchedule & PaymentVerifier contracts
-  - Use OpenZeppelin primitives for safety
-
-  Notes:
-  - This contract expects the caller (owner) to be the employer / payroll admin.
-  - On-chain release requires that the external PaymentVerifier has previously recorded/verified
-    an off-chain facilitator payment proof (i.e., `isVerified(employee, periodId) == true`).
-  - The SalarySchedule contract is used to check due-ness and to confirm paid periods (confirmPaid).
-*/
-
-// OpenZeppelin imports
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-enum Cadence {
-    Minute, // for testing
-    Hourly,
-    Biweekly,
-    Monthly
-}
+/**
+ * @title PayrollVault - Simplified for Cronos x402 Facilitator
+ * @dev Manages payroll deposits and payment tracking for BlockWage
+ *
+ * Key Changes from Original:
+ * - Removed PaymentVerifier dependency (facilitator handles verification)
+ * - Removed releaseSalary() (facilitator executes direct USDC transfer via EIP-3009)
+ * - Added recordPayment() to track payments settled by facilitator
+ * - Simplified to focus on fund custody and payment tracking
+ *
+ * Flow:
+ * 1. Employer deposits USDC for specific periods
+ * 2. Employee claims salary via backend (returns 402 response)
+ * 3. Employee signs EIP-3009 authorization
+ * 4. Cronos Facilitator executes gasless USDC transfer
+ * 5. Facilitator webhook calls backend
+ * 6. Backend calls recordPayment() to mark as paid and update accounting
+ */
 
 interface ISalarySchedule {
-    // Mirrors the SalarySchedule contract API used by this project
     function isDue(
-        address _employee,
+        address employee,
         uint256 periodId
     ) external view returns (bool, string memory);
 
     function confirmPaid(
-        address _employee,
+        address employee,
         uint256 periodId,
         uint256 paidTimestamp
     ) external;
-
-    // Optional: try to sync assignment on the schedule
-
-    function getEmployee(
-        address _employee
-    ) external view returns (uint256, Cadence, uint256, bool);
 }
 
 contract PayrollVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // Stablecoin token used for payroll (devUSDC.e)
+    // Stablecoin token (USDC with EIP-3009 support)
     IERC20 public immutable token;
 
-    // Linked contracts
+    // Linked SalarySchedule contract
     ISalarySchedule public salarySchedule;
 
-    // Tracks per-period reserved balances (employer deposits tied to a periodId)
+    // Period deposits: periodId => total deposited
     mapping(uint256 => uint256) public periodBalances;
 
-    // Prevent double payout
+    // Payment tracking: employee => periodId => paid
     mapping(address => mapping(uint256 => bool)) public paid;
 
-    // Total token balance held by vault (cached)
+    // Total balance held (for accounting)
     uint256 public totalBalance;
 
     // Events
@@ -76,167 +62,158 @@ contract PayrollVault is Ownable, ReentrancyGuard {
         uint256 indexed periodId,
         uint256 amount
     );
-    event EmployeeAssigned(
-        address indexed employee,
-        uint256 salary,
-        Cadence cadence
-    );
-    event SalaryReleased(
+
+    event PaymentRecorded(
         address indexed employee,
         uint256 indexed periodId,
         uint256 amount,
-        address indexed to
+        uint256 timestamp
     );
-    event ExcessWithdrawn(address indexed to, uint256 amount);
+
     event SalaryScheduleUpdated(address indexed schedule);
 
+    event FundsWithdrawn(address indexed to, uint256 amount);
+
     /**
-     * @param _token Stablecoin token address (devUSDC.e)
-     * @param _salarySchedule SalarySchedule contract (can be zero initially)
+     * @param _token USDC token address (must support EIP-3009)
+     * @param _salarySchedule SalarySchedule contract address
      */
     constructor(address _token, address _salarySchedule) Ownable(msg.sender) {
         require(_token != address(0), "token-zero");
-        token = IERC20(_token);
+        require(_salarySchedule != address(0), "schedule-zero");
 
-        if (_salarySchedule != address(0)) {
-            salarySchedule = ISalarySchedule(_salarySchedule);
-            emit SalaryScheduleUpdated(_salarySchedule);
-        }
+        token = IERC20(_token);
+        salarySchedule = ISalarySchedule(_salarySchedule);
+
+        emit SalaryScheduleUpdated(_salarySchedule);
     }
 
-    /* ======================
+    /* ===========================
        Administration
-       ====================== */
+       =========================== */
 
-    /// @notice Update the SalarySchedule contract address
+    /**
+     * @notice Update the SalarySchedule contract address
+     * @param _schedule New schedule address
+     */
     function setSalarySchedule(address _schedule) external onlyOwner {
         require(_schedule != address(0), "schedule-zero");
         salarySchedule = ISalarySchedule(_schedule);
         emit SalaryScheduleUpdated(_schedule);
     }
 
-    /* ======================
-       Deposits & Withdrawals
-       ====================== */
+    /* ===========================
+       Deposit & Withdrawal
+       =========================== */
 
     /**
-     * @notice Deposit funds for a particular payroll period.
-     * Employer must approve token transfer to this contract before calling.
-     * @param periodId Identifier for payroll period (scheduler-defined)
-     * @param amount Amount of token to deposit (in token smallest unit)
+     * @notice Deposit funds for a payroll period
+     * @dev Employer must approve token transfer before calling
+     * @param periodId Period identifier (unix timestamp aligned to cadence)
+     * @param amount Amount of USDC to deposit (in smallest units)
      */
     function depositPayroll(
         uint256 periodId,
         uint256 amount
     ) external onlyOwner nonReentrant {
         require(amount > 0, "amount-zero");
-        // Transfer tokens from caller into this vault
+
+        // Transfer USDC from employer to vault
         token.safeTransferFrom(msg.sender, address(this), amount);
+
+        // Update period balance and total
         periodBalances[periodId] += amount;
         totalBalance += amount;
+
         emit PayrollDeposited(msg.sender, periodId, amount);
     }
 
     /**
-     * @notice Withdraw unreserved / excess funds from the vault.
-     * Only allows withdrawing tokens that are not reserved for future periodBalances.
+     * @notice Withdraw excess funds (not allocated to any period)
+     * @dev Only callable by owner for emergency recovery
+     * @param to Recipient address
+     * @param amount Amount to withdraw
      */
     function withdrawExcess(
         address to,
         uint256 amount
     ) external onlyOwner nonReentrant {
         require(to != address(0), "to-zero");
-        uint256 reserved = _totalReserved();
-        uint256 available = totalBalance > reserved
-            ? totalBalance - reserved
-            : 0;
-        require(amount <= available, "insufficient-available");
+        require(amount <= totalBalance, "insufficient-balance");
+
         totalBalance -= amount;
         token.safeTransfer(to, amount);
-        emit ExcessWithdrawn(to, amount);
+
+        emit FundsWithdrawn(to, amount);
     }
 
-    /* ======================
-       Salary release flow
-       ====================== */
+    /* ===========================
+       Payment Recording (Post-Facilitator)
+       =========================== */
 
     /**
-     * @notice Release salary for an employee for a given periodId.
-     * Preconditions:
-     *  - Employee must be assigned in this vault
-     *  - SalarySchedule.isDue(employee, periodId) must be true
-     *  - PaymentVerifier.isVerified(employee, periodId) must be true (off-chain facilitator proof verified)
-     *  - Vault must hold sufficient period balance (periodBalances[periodId] >= salary)
+     * @notice Record a payment that was settled by Cronos Facilitator
+     * @dev Called by backend after receiving facilitator webhook
      *
-     * On success:
-     *  - Transfers tokens to employee
-     *  - Marks paid mapping to prevent double-pay
-     *  - Calls SalarySchedule.confirmPaid to finalize schedule state (requires this contract caller is the owner of schedule or caller is owner)
+     * The actual USDC transfer happens via EIP-3009 (transferWithAuthorization),
+     * executed by the facilitator. This function just records the payment occurred
+     * and updates our accounting.
      *
-     * Note: This function is onlyOwner: the payroll admin (or automated operator) calls it after the facilitator flow completes.
+     * @param employee Employee address
+     * @param periodId Period identifier
+     * @param amount Amount that was paid
      */
-    function releaseSalary(
+    function recordPayment(
         address employee,
-        uint256 periodId
+        uint256 periodId,
+        uint256 amount
     ) external onlyOwner nonReentrant {
-        // Get salary & existence directly from schedule
-        (uint256 salary, , , bool exists) = salarySchedule.getEmployee(
-            employee
-        );
-
-        require(exists, "employee-not-assigned-in-schedule");
+        require(employee != address(0), "employee-zero");
         require(!paid[employee][periodId], "already-paid");
 
-        // Validate schedule due-ness
-        if (address(salarySchedule) != address(0)) {
-            (bool due, string memory reason) = salarySchedule.isDue(
-                employee,
-                periodId
-            );
-            require(due, reason);
-        } else {
-            revert("schedule-not-set");
-        }
+        // Verify payment is actually due according to schedule
+        (bool due, string memory reason) = salarySchedule.isDue(
+            employee,
+            periodId
+        );
+        require(due, reason);
 
-        // x402 facilitator has already verified off-chain / real-world payment proof
-        // we only enforce schedule rules + sufficient on-chain reserves
-
-        uint256 amount = salary;
-        // Ensure period has enough balance; if not, fail
+        // Ensure we had allocated funds for this period
         require(
             periodBalances[periodId] >= amount,
             "insufficient-period-funds"
         );
 
-        // Mark as paid first to avoid reentrancy / double transfer risk
+        // Mark as paid (prevents double-payment)
         paid[employee][periodId] = true;
 
-        // Deduct from period balance and global total
+        // Deduct from period balance
         periodBalances[periodId] -= amount;
-        totalBalance -= amount;
 
-        // Perform token transfer
-        token.safeTransfer(employee, amount);
+        // Note: totalBalance is NOT decreased here because the USDC was already
+        // transferred directly from employee's signature via EIP-3009.
+        // The vault never actually held these specific funds for the transfer.
 
-        emit SalaryReleased(employee, periodId, amount, employee);
+        emit PaymentRecorded(employee, periodId, amount, block.timestamp);
 
-        // Confirm paid on schedule contract (this contract or the owner must have permission there)
-        // We call confirmPaid via SalarySchedule. Note that confirmPaid is onlyOwner in SalarySchedule
-        // so this contract cannot call it unless this contract is the owner there. Typically the same
-        // owner account will call salarySchedule.confirmPaid off-chain after or in a separate admin step.
-        // For best-effort, attempt a call but do not revert if it fails (owner should ensure schedule state consistency).
+        // Confirm payment on schedule contract
         try salarySchedule.confirmPaid(employee, periodId, block.timestamp) {
-            // fine
+            // Success
         } catch {
-            // swallow; owner must reconcile
+            // Swallow error; owner can manually sync if needed
         }
     }
 
-    /* ======================
-       Views & helpers
-       ====================== */
+    /* ===========================
+       View Functions
+       =========================== */
 
-    /// @notice Returns whether a given (employee, periodId) has already been paid
+    /**
+     * @notice Check if a payment has been recorded
+     * @param employee Employee address
+     * @param periodId Period identifier
+     * @return True if payment was recorded
+     */
     function isPaid(
         address employee,
         uint256 periodId
@@ -244,25 +221,33 @@ contract PayrollVault is Ownable, ReentrancyGuard {
         return paid[employee][periodId];
     }
 
-    /// @notice Compute total reserved by summing all periodBalances (gas expensive if many periods).
-    /// For gas reasons, callers (owner) are expected to track deposits/periods off-chain; this helper is provided.
-    function _totalReserved() internal view returns (uint256) {
-        // There's no efficient way to iterate mapping in solidity; we rely on caller's bookkeeping
-        // and only use this in contexts where the owner provides accurate accounting.
-        // As a safe fallback for withdrawExcess we assume reserved == sum(periodBalances tracked externally),
-        // but here we cannot compute it - return 0 to allow withdraw only if owner tracks properly.
-        // To be safer, we prevent withdrawExcess if there are any non-zero periodBalances by requiring external check.
-        // A pragmatic approach: if any periodBalances are non-zero, disallow withdrawExcess unless owner passes explicit
-        // period lists. For simplicity in this implementation we compute a minimal reserved by checking a small window
-        // (not implemented). We'll implement withdrawExcess to require available amount computed as totalBalance - minReserved.
-        revert("not-implemented-totalReserved");
+    /**
+     * @notice Get available balance for a specific period
+     * @param periodId Period identifier
+     * @return Available balance for that period
+     */
+    function getPeriodBalance(
+        uint256 periodId
+    ) external view returns (uint256) {
+        return periodBalances[periodId];
     }
 
-    /* ======================
-       Emergency / Admin utilities
-       ====================== */
+    /**
+     * @notice Get vault's total USDC balance
+     * @return Current USDC balance of the vault
+     */
+    function getVaultBalance() external view returns (uint256) {
+        return token.balanceOf(address(this));
+    }
 
-    /// @notice Admin can mark a paid flag as false to undo a payment (useful for recovery). Use with extreme caution.
+    /* ===========================
+       Emergency Functions
+       =========================== */
+
+    /**
+     * @notice Admin can clear paid flag for recovery
+     * @dev Use with extreme caution - only for error correction
+     */
     function adminClearPaid(
         address employee,
         uint256 periodId
@@ -270,12 +255,16 @@ contract PayrollVault is Ownable, ReentrancyGuard {
         paid[employee][periodId] = false;
     }
 
-    /// @notice Emergency rescue of tokens (only owner). Useful if integrating with new schedule or verifier.
+    /**
+     * @notice Emergency token rescue
+     * @dev Allows recovery of accidentally sent tokens
+     */
     function rescueTokens(
+        address tokenAddress,
         address to,
         uint256 amount
     ) external onlyOwner nonReentrant {
         require(to != address(0), "to-zero");
-        token.safeTransfer(to, amount);
+        IERC20(tokenAddress).safeTransfer(to, amount);
     }
 }

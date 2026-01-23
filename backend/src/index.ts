@@ -3,24 +3,34 @@ import dotenv from "dotenv";
 import { ethers } from "ethers";
 import winston from "winston";
 import bodyParser from "body-parser";
+import crypto from "crypto";
+import axios from "axios";
+import cors from "cors";
 
 dotenv.config();
 
 /**
- * BlockWage - Express HTTP server
+ * BlockWage Backend - Cronos x402 Facilitator Integration
+ *
+ * This backend integrates with Cronos Labs x402 Facilitator for gasless salary payments.
  *
  * Endpoints:
- *  - GET  /salary/claim/:employeeAddress   -> returns x402 402 Payment Required response describing how to pay employee
- *  - POST /salary/verify                   -> accept facilitator proof or txHash, verifies and triggers on-chain release
+ *  - GET  /salary/claim/:employeeAddress   -> Returns x402 Payment Required response
+ *  - POST /salary/webhook                  -> Receives facilitator payment notifications
+ *  - POST /salary/verify                   -> Alternative: Poll-based verification
+ *  - POST /admin/deposit                   -> Employer deposits funds
+ *  - GET  /admin/employee/:address         -> Get employee details
  *
- * Environment variables expected:
- *  - RPC_URL                      Cronos RPC endpoint (testnet)
- *  - PRIVATE_KEY                   Private key used to sign on-chain release txs (owner/admin)
- *  - SALARY_SCHEDULE_ADDRESS       Deployed SalarySchedule contract address
- *  - PAYMENT_VERIFIER_ADDRESS      Deployed PaymentVerifier contract address
- *  - PAYROLL_VAULT_ADDRESS         Deployed PayrollVault contract address
- *  - STABLECOIN_ADDRESS            devUSDC.e token address used for payouts
- *  - PORT                          HTTP server port (default 3000)
+ * Environment variables:
+ *  - RPC_URL                       Cronos RPC endpoint
+ *  - PRIVATE_KEY                   Admin wallet private key
+ *  - SALARY_SCHEDULE_ADDRESS       SalarySchedule contract
+ *  - PAYROLL_VAULT_ADDRESS         PayrollVault contract
+ *  - USDC_ADDRESS                  USDC token (EIP-3009 compatible)
+ *  - FACILITATOR_URL               Cronos facilitator endpoint
+ *  - NETWORK_ID                    CAIP-2 network identifier (eip155:25 for Cronos mainnet)
+ *  - WEBHOOK_SECRET                Secret for webhook signature verification
+ *  - PORT                          Server port (default 3000)
  */
 
 /* ===========================
@@ -30,174 +40,166 @@ const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || "info",
   format: winston.format.combine(
     winston.format.timestamp(),
-    winston.format.printf(
-      ({ timestamp, level, message, ...meta }) =>
-        `${timestamp} [${level}] ${message} ${
-          Object.keys(meta).length ? JSON.stringify(meta) : ""
-        }`
-    )
+    winston.format.printf(({ timestamp, level, message, ...meta }) => {
+      const metaStr = Object.keys(meta).length ? JSON.stringify(meta) : "";
+      return `${timestamp} [${level.toUpperCase()}] ${message} ${metaStr}`;
+    })
   ),
   transports: [new winston.transports.Console()],
 });
 
 /* ===========================
-   Environment & Provider
+   Environment Configuration
    =========================== */
 const RPC_URL = process.env.RPC_URL || "https://evm-t3.cronos.org";
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
 const SALARY_SCHEDULE_ADDRESS = process.env.SALARY_SCHEDULE_ADDRESS || "";
-const PAYMENT_VERIFIER_ADDRESS = process.env.PAYMENT_VERIFIER_ADDRESS || "";
 const PAYROLL_VAULT_ADDRESS = process.env.PAYROLL_VAULT_ADDRESS || "";
-const STABLECOIN_ADDRESS = process.env.STABLECOIN_ADDRESS || "";
+const USDC_ADDRESS = process.env.USDC_ADDRESS || "";
+const FACILITATOR_URL =
+  process.env.FACILITATOR_URL || "https://facilitator-testnet.cronoslabs.org";
+const NETWORK_ID = process.env.NETWORK_ID || "eip155:338"; // 338 = Cronos testnet, 25 = mainnet
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me-in-production";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
-if (!PRIVATE_KEY) {
-  logger.warn(
-    "PRIVATE_KEY not set - some endpoints requiring on-chain signatures will fail"
-  );
-}
+// Validation
+const requiredEnvVars = {
+  PRIVATE_KEY,
+  SALARY_SCHEDULE_ADDRESS,
+  PAYROLL_VAULT_ADDRESS,
+  USDC_ADDRESS,
+};
 
-if (!SALARY_SCHEDULE_ADDRESS) {
-  logger.warn(
-    "SALARY_SCHEDULE_ADDRESS not set - GET /salary/claim will be limited"
-  );
-}
-
-if (!STABLECOIN_ADDRESS) {
-  logger.warn(
-    "STABLECOIN_ADDRESS not set - x402 responses may have empty token"
-  );
+for (const [key, value] of Object.entries(requiredEnvVars)) {
+  if (!value) {
+    logger.error(`Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
 }
 
 /* ===========================
-   Minimal ABIs (subset of contract interfaces used)
+   Contract ABIs
    =========================== */
 const SalaryScheduleABI = [
   "function getEmployee(address) view returns (uint256,uint8,uint256,bool)",
   "function nextExpectedPeriod(address) view returns (uint256)",
+  "function isDue(address,uint256) view returns (bool,string)",
 ];
 
-const PaymentVerifierABI = [
-  "function isVerified(address,uint256) view returns (bool)",
-  "function verifyPayment(bytes calldata) returns (bool)",
+const PayrollVaultABI = [
+  "function depositPayroll(uint256,uint256)",
+  "function recordPayment(address,uint256,uint256)",
+  "function isPaid(address,uint256) view returns (bool)",
+  "function periodBalances(uint256) view returns (uint256)",
 ];
 
-const PayrollVaultABI = ["function releaseSalary(address,uint256)"];
+const USDC_ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function allowance(address,address) view returns (uint256)",
+  "function approve(address,uint256) returns (bool)",
+];
 
 /* ===========================
-   Ethers setup
+   Ethers Setup
    =========================== */
 const provider = new ethers.JsonRpcProvider(RPC_URL);
-const signer = PRIVATE_KEY
-  ? new ethers.Wallet(PRIVATE_KEY, provider)
-  : undefined;
+const signer = new ethers.Wallet(PRIVATE_KEY, provider);
 
-let salaryScheduleContract: ethers.Contract | undefined;
-let paymentVerifierContract: ethers.Contract | undefined;
-let payrollVaultContract: ethers.Contract | undefined;
+const salarySchedule = new ethers.Contract(
+  SALARY_SCHEDULE_ADDRESS,
+  SalaryScheduleABI,
+  provider
+);
 
-try {
-  if (SALARY_SCHEDULE_ADDRESS) {
-    salaryScheduleContract = new ethers.Contract(
-      SALARY_SCHEDULE_ADDRESS,
-      SalaryScheduleABI,
-      provider
-    );
-  }
-  if (PAYMENT_VERIFIER_ADDRESS && signer) {
-    paymentVerifierContract = new ethers.Contract(
-      PAYMENT_VERIFIER_ADDRESS,
-      PaymentVerifierABI,
-      signer
-    );
-  }
-  if (PAYROLL_VAULT_ADDRESS && signer) {
-    payrollVaultContract = new ethers.Contract(
-      PAYROLL_VAULT_ADDRESS,
-      PayrollVaultABI,
-      signer
-    );
-  }
-} catch (err) {
-  logger.error("Failed to instantiate contracts", { error: err });
+const payrollVault = new ethers.Contract(
+  PAYROLL_VAULT_ADDRESS,
+  PayrollVaultABI,
+  signer
+);
+
+const usdcToken = new ethers.Contract(USDC_ADDRESS, USDC_ABI, signer);
+
+logger.info("Contracts initialized", {
+  schedule: SALARY_SCHEDULE_ADDRESS,
+  vault: PAYROLL_VAULT_ADDRESS,
+  usdc: USDC_ADDRESS,
+  network: NETWORK_ID,
+  facilitator: FACILITATOR_URL,
+});
+
+/* ===========================
+   Helper Functions
+   =========================== */
+
+/**
+ * Verify webhook signature from Cronos Facilitator
+ */
+function verifyWebhookSignature(
+  payload: any,
+  signature: string | undefined
+): boolean {
+  if (!signature) return false;
+
+  const payloadStr = JSON.stringify(payload);
+  const expectedSignature = crypto
+    .createHmac("sha256", WEBHOOK_SECRET)
+    .update(payloadStr)
+    .digest("hex");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expectedSignature)
+  );
+}
+
+/**
+ * Format amount for display (assumes 6 decimals for USDC)
+ */
+function formatAmount(amount: string): string {
+  return ethers.formatUnits(amount, 6);
 }
 
 /* ===========================
-   Facilitator client wrapper
+   In-Memory Idempotence Cache
+   NOTE: Use Redis/Database for production
    =========================== */
-type FacilitatorClientType = {
-  createPayment?: (opts: any) => Promise<any>;
-  verifyProof?: (proof: string) => Promise<boolean>;
-};
+const processedWebhooks = new Set<string>();
+const processedPayments = new Map<
+  string,
+  { txHash: string; timestamp: number }
+>();
 
-class FacilitatorWrapper {
-  client: FacilitatorClientType | null = null;
-  available = false;
-
-  constructor() {
-    try {
-      // Try to require the SDK dynamically
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const sdk = require("@crypto.com/facilitator-client");
-      this.client = {
-        createPayment: sdk.createPayment
-          ? sdk.createPayment.bind(sdk)
-          : undefined,
-        verifyProof: sdk.verifyProof ? sdk.verifyProof.bind(sdk) : undefined,
-      };
-      this.available = true;
-      logger.info("Facilitator SDK loaded");
-    } catch (e) {
-      this.client = null;
-      this.available = false;
-      logger.warn("Facilitator SDK not available; using local stub behavior", {
-        reason: (e as Error).message,
-      });
-    }
-  }
-
-  async verifyProof(proofHex: string): Promise<boolean> {
-    if (this.available && this.client?.verifyProof) {
-      try {
-        return await this.client.verifyProof(proofHex);
-      } catch (err) {
-        logger.error("Facilitator SDK verifyProof failed", { error: err });
-        return false;
-      }
-    }
-    // Fallback: naive local stub - treat non-empty hex as valid
-    return !!proofHex;
-  }
+function getPaymentKey(employee: string, periodId: number | string): string {
+  return `${employee.toLowerCase()}:${periodId}`;
 }
 
-const facilitator = new FacilitatorWrapper();
-
 /* ===========================
-   In-memory idempotence caches
-   NOTE: For production use persistent storage (DB/Redis)
-   =========================== */
-const verifiedProofs = new Set<string>();
-const processedPayouts = new Set<string>();
-
-/* ===========================
-   Express app
+   Express App
    =========================== */
 const app = express();
 app.use(bodyParser.json());
 
 // Request logger
-app.use((req: Request, _res: Response, next: NextFunction) => {
-  logger.info(`HTTP ${req.method} ${req.path}`, {
+app.use((req: Request, res: Response, next: NextFunction) => {
+  logger.info(`${req.method} ${req.path}`, {
+    ip: req.ip,
+    params: req.params,
     query: req.query,
-    body: req.body,
   });
   next();
 });
 
+app.use(cors());
+
+/* ===========================
+   Core Endpoints
+   =========================== */
+
 /**
  * GET /salary/claim/:employeeAddress
  *
- * Returns a 402 Payment Required response (x402 style) when there's a salary due for the employee.
+ * Returns x402 Payment Required response per Cronos facilitator spec.
+ * This endpoint is called by employees or automated schedulers to initiate payment.
  */
 app.get(
   "/salary/claim/:employeeAddress",
@@ -205,292 +207,536 @@ app.get(
     const { employeeAddress } = req.params;
 
     if (!ethers.isAddress(employeeAddress)) {
-      return res.status(400).json({ error: "invalid-employee-address" });
+      return res.status(400).json({
+        error: "invalid-address",
+        message: "Employee address is not a valid Ethereum address",
+      });
     }
 
     try {
-      let salary = "0";
-      let periodId = 0;
+      // Fetch employee data from SalarySchedule
+      const employeeInfo = await salarySchedule.getEmployee(employeeAddress);
+      const [salaryBn, cadence, lastPaid, exists] = employeeInfo;
 
-      if (salaryScheduleContract) {
-        try {
-          const employeeInfo = (await salaryScheduleContract.getEmployee(
-            employeeAddress
-          )) as [bigint, number, bigint, boolean];
-          const [salaryBn, , , existsFlag] = employeeInfo;
-
-          if (!existsFlag) {
-            return res.status(404).json({
-              error: "no-salary-assigned",
-              message: "No salary information available for this employee",
-            });
-          }
-
-          salary = salaryBn.toString();
-        } catch (err) {
-          logger.warn("getEmployee call failed", {
-            error: (err as Error).message,
-          });
-        }
-
-        try {
-          const nextPeriod = (await salaryScheduleContract.nextExpectedPeriod(
-            employeeAddress
-          )) as bigint;
-          periodId = Number(nextPeriod.toString());
-        } catch (err) {
-          logger.warn("nextExpectedPeriod call failed", {
-            error: (err as Error).message,
-          });
-          periodId = Math.floor(Date.now() / 1000);
-        }
-      } else {
-        logger.warn(
-          "SalarySchedule contract not configured; returning best-effort x402 response"
-        );
-        salary = req.query.amount ? String(req.query.amount) : "0";
-        periodId = Math.floor(Date.now() / 1000);
-      }
-
-      if (salary === "0") {
+      if (!exists) {
         return res.status(404).json({
-          error: "no-salary-assigned",
-          message: "No salary information available for this employee",
+          error: "employee-not-found",
+          message: "No salary configuration found for this address",
         });
       }
 
-      const x402Body = {
-        to: employeeAddress,
-        amount: salary,
-        token: STABLECOIN_ADDRESS,
-        periodId,
-        currency: "USDC",
+      const salary = salaryBn.toString();
+      if (salary === "0") {
+        return res.status(404).json({
+          error: "no-salary-assigned",
+          message: "Salary amount is zero",
+        });
+      }
+
+      // Get next expected payment period
+      const nextPeriodBn = await salarySchedule.nextExpectedPeriod(
+        employeeAddress
+      );
+      const periodId = Number(nextPeriodBn.toString());
+
+      // Check if already paid for this period
+      const alreadyPaid = await payrollVault.isPaid(employeeAddress, periodId);
+      if (alreadyPaid) {
+        return res.status(200).json({
+          message: "Salary already paid for this period",
+          employee: employeeAddress,
+          periodId,
+          amount: salary,
+          status: "paid",
+        });
+      }
+
+      // Check if payment is actually due
+      const [isDue, reason] = await salarySchedule.isDue(
+        employeeAddress,
+        periodId
+      );
+
+      if (!isDue) {
+        return res.status(400).json({
+          error: "payment-not-due",
+          message: reason || "Payment is not due yet for this period",
+          periodId,
+          nextPeriod: new Date(periodId * 1000).toISOString(),
+        });
+      }
+
+      // Check vault has sufficient funds for this period
+      const periodBalance = await payrollVault.periodBalances(periodId);
+      if (BigInt(periodBalance.toString()) < BigInt(salary)) {
+        return res.status(503).json({
+          error: "insufficient-funds",
+          message:
+            "Employer has not deposited sufficient funds for this period",
+          required: salary,
+          available: periodBalance.toString(),
+        });
+      }
+
+      // Build x402 Payment Required response per Cronos facilitator spec
+      const paymentRequirements = {
+        scheme: "exact",
+        network: NETWORK_ID,
+        maxAmountRequired: salary, // in smallest units (e.g., 1000000 = 1 USDC)
+        payTo: PAYROLL_VAULT_ADDRESS, // Vault receives the payment
+        asset: USDC_ADDRESS,
+        resource: `/salary/claim/${employeeAddress}`,
+        description: `BlockWage salary payment - Period ${periodId}`,
+        metadata: {
+          employee: employeeAddress,
+          periodId,
+          amount: salary,
+          cadence,
+          timestamp: Math.floor(Date.now() / 1000),
+        },
       };
 
-      return res.status(402).set("Content-Type", "application/x402+json").json({
-        code: 402,
-        message: "Payment Required",
-        x402: x402Body,
+      logger.info("Payment required response generated", {
+        employee: employeeAddress,
+        amount: formatAmount(salary),
+        periodId,
       });
-    } catch (err) {
-      logger.error("Error in /salary/claim handler", {
-        error: (err as Error).message,
+
+      // Return 402 Payment Required with x402 spec
+      return res.status(402).json({
+        error: "Payment Required",
+        paymentRequirements,
+        facilitatorUrl: FACILITATOR_URL,
+        instructions: {
+          step1: "Generate EIP-3009 signature using your wallet",
+          step2: `POST signature to ${FACILITATOR_URL}/settle`,
+          step3:
+            "Facilitator will execute gasless transfer and notify this backend",
+        },
       });
-      return res.status(500).json({ error: "internal_error" });
+    } catch (err: any) {
+      logger.error("Error in /salary/claim", {
+        employee: employeeAddress,
+        error: err.message,
+        stack: err.stack,
+      });
+      return res.status(500).json({
+        error: "internal-error",
+        message: "Failed to process salary claim request",
+      });
     }
   }
 );
 
 /**
- * POST /salary/verify
+ * POST /salary/webhook
  *
- * Accepts:
- *   - { facilitatorProof: string, employee: string, periodId: number }
- *   OR
- *   - { txHash: string, employee: string, periodId: number }
- *
- * Flow:
- *  1. Verify facilitator proof
- *  2. Ensure idempotence
- *  3. Call PaymentVerifier.verifyPayment on-chain
- *  4. Call PayrollVault.releaseSalary to trigger transfer
+ * Webhook endpoint called by Cronos Facilitator after successful payment settlement.
+ * This records the payment on-chain and prevents double-payment.
  */
-app.post("/salary/verify", async (req: Request, res: Response) => {
-  const { facilitatorProof, txHash, employee, periodId } = req.body;
-
-  if (!employee || !ethers.isAddress(employee)) {
-    return res.status(400).json({ error: "invalid-employee" });
-  }
-  if (!periodId) {
-    return res.status(400).json({ error: "missing-periodId" });
-  }
-
+app.post("/salary/webhook", async (req: Request, res: Response) => {
   try {
-    const payoutKey = `${employee.toLowerCase()}:${periodId}`;
+    const signature = req.headers["x-webhook-signature"] as string;
+    const webhookId = req.headers["x-webhook-id"] as string;
 
-    if (processedPayouts.has(payoutKey)) {
-      logger.info("Payout already processed; returning idempotent success", {
-        payoutKey,
-      });
-      return res.status(200).json({ result: "already_processed", payoutKey });
+    // Verify webhook signature
+    if (!verifyWebhookSignature(req.body, signature)) {
+      logger.warn("Invalid webhook signature", { webhookId });
+      return res.status(401).json({ error: "invalid-signature" });
     }
 
-    // Handle txHash verification
-    if (txHash) {
-      logger.info("txHash provided; verifying transaction", { txHash });
-
-      const receipt = await provider.getTransactionReceipt(txHash);
-      if (!receipt) {
-        return res.status(404).json({ error: "tx-not-found" });
-      }
-
-      if (receipt.status !== 1) {
-        return res.status(400).json({ error: "tx-failed", txHash });
-      }
-
-      processedPayouts.add(payoutKey);
-      logger.info("Payout marked processed (via txHash)", {
-        payoutKey,
-        txHash,
-      });
-      return res.status(200).json({ result: "ok", txHash });
+    // Idempotency check
+    if (webhookId && processedWebhooks.has(webhookId)) {
+      logger.info("Webhook already processed", { webhookId });
+      return res.status(200).json({ status: "already-processed" });
     }
 
-    // Handle facilitatorProof verification
-    if (!facilitatorProof) {
-      return res
-        .status(400)
-        .json({ error: "missing-facilitatorProof-or-txHash" });
+    const { event, employee, periodId, amount, txHash, timestamp, metadata } =
+      req.body;
+
+    // Validate event type
+    if (event !== "payment.completed") {
+      logger.warn("Unexpected webhook event type", { event });
+      return res.status(400).json({ error: "unexpected-event-type" });
     }
 
-    if (!verifiedProofs.has(facilitatorProof)) {
-      const sdkOk = await facilitator.verifyProof(facilitatorProof);
-      if (!sdkOk) {
-        logger.warn("Facilitator SDK rejected proof", {
-          proofSnippet: facilitatorProof.slice(0, 20),
-        });
-      }
-      verifiedProofs.add(facilitatorProof);
+    // Validate required fields
+    if (!employee || !periodId || !amount) {
+      logger.warn("Missing required webhook fields", req.body);
+      return res.status(400).json({ error: "missing-required-fields" });
     }
 
-    // Validate contracts and signer
-    if (!paymentVerifierContract) {
-      logger.error("PaymentVerifier contract not configured");
-      return res.status(500).json({ error: "payment_verifier_not_configured" });
-    }
-    if (!payrollVaultContract) {
-      logger.error("PayrollVault contract not configured");
-      return res.status(500).json({ error: "payroll_vault_not_configured" });
-    }
-    if (!signer) {
-      logger.error("On-chain signer not configured (missing PRIVATE_KEY)");
-      return res.status(500).json({ error: "server_no_signer" });
-    }
-
-    // Call PaymentVerifier.verifyPayment on-chain
-    logger.info("Calling PaymentVerifier.verifyPayment on-chain", {
-      verifier: PAYMENT_VERIFIER_ADDRESS,
-    });
-
-    const proofBytes = ethers.getBytes(facilitatorProof);
-    const verifyTx = await paymentVerifierContract.verifyPayment(proofBytes);
-    const verifyReceipt = await verifyTx.wait();
-
-    logger.info("PaymentVerifier.verifyPayment tx mined", {
-      txHash: verifyReceipt?.hash,
-    });
-
-    // Call PayrollVault.releaseSalary
-    logger.info("Calling PayrollVault.releaseSalary to release funds", {
-      vault: PAYROLL_VAULT_ADDRESS,
+    logger.info("Facilitator webhook received", {
       employee,
       periodId,
+      amount: formatAmount(amount),
+      txHash,
+      webhookId,
     });
 
-    const releaseTx = await payrollVaultContract.releaseSalary(
+    // Verify employee exists in our system
+    const employeeInfo = await salarySchedule.getEmployee(employee);
+    if (!employeeInfo[3]) {
+      logger.error("Webhook for unknown employee", { employee });
+      return res.status(400).json({ error: "employee-not-found" });
+    }
+
+    const expectedAmount = employeeInfo[0].toString();
+    if (amount !== expectedAmount) {
+      logger.error("Amount mismatch", {
+        expected: expectedAmount,
+        received: amount,
+      });
+      return res.status(400).json({ error: "amount-mismatch" });
+    }
+
+    // Check if already recorded
+    const paymentKey = getPaymentKey(employee, periodId);
+    const alreadyPaid = await payrollVault.isPaid(employee, periodId);
+
+    if (alreadyPaid) {
+      logger.info("Payment already recorded on-chain", { paymentKey });
+      if (webhookId) processedWebhooks.add(webhookId);
+      return res.status(200).json({ status: "already-recorded" });
+    }
+
+    // Record payment on-chain
+    logger.info("Recording payment on-chain", { employee, periodId });
+    const tx = await payrollVault.recordPayment(employee, periodId, amount);
+    const receipt = await tx.wait();
+
+    // Update local cache
+    if (webhookId) processedWebhooks.add(webhookId);
+    processedPayments.set(paymentKey, {
+      txHash: receipt.hash,
+      timestamp: Math.floor(Date.now() / 1000),
+    });
+
+    logger.info("Payment recorded successfully", {
       employee,
-      BigInt(periodId)
-    );
-    const releaseReceipt = await releaseTx.wait();
-
-    processedPayouts.add(payoutKey);
-
-    logger.info("Salary released successfully", {
-      payoutKey,
-      releaseTxHash: releaseReceipt?.hash,
+      periodId,
+      recordTxHash: receipt.hash,
+      facilitatorTxHash: txHash,
     });
 
     return res.status(200).json({
-      result: "ok",
-      releaseTxHash: releaseReceipt?.hash,
-      verifyTxHash: verifyReceipt?.hash,
-      payoutKey,
+      status: "success",
+      recordTxHash: receipt.hash,
+      facilitatorTxHash: txHash,
+      employee,
+      periodId,
     });
-  } catch (err) {
-    logger.error("Error in /salary/verify handler", {
-      error: (err as Error).message,
-      stack: (err as Error).stack,
+  } catch (err: any) {
+    logger.error("Webhook processing error", {
+      error: err.message,
+      stack: err.stack,
       body: req.body,
     });
     return res.status(500).json({
-      error: "internal_error",
-      reason: (err as Error).message,
+      error: "internal-error",
+      message: "Failed to process webhook",
     });
   }
 });
 
 /**
- * POST /simulate-facilitator
+ * POST /salary/verify
  *
- * Demo endpoint for testing - generates a deterministic proof
+ * Alternative verification method: manually verify payment via facilitator API.
+ * Use this if webhooks are not available or for manual reconciliation.
  */
-app.post("/simulate-facilitator", async (req: Request, res: Response) => {
-  const { x402 } = req.body;
+app.post("/salary/verify", async (req: Request, res: Response) => {
+  const { paymentHeader, employee, periodId } = req.body;
 
-  if (!x402 || !x402.to || !x402.amount || !x402.periodId) {
-    return res.status(400).json({ error: "invalid-x402-payload" });
+  if (!paymentHeader || !employee || !periodId) {
+    return res.status(400).json({
+      error: "missing-fields",
+      required: ["paymentHeader", "employee", "periodId"],
+    });
   }
 
   try {
-    // Generate deterministic proof: employee(20) + periodId(32) + amount(32)
-    const employeeBytes = ethers.getBytes(ethers.zeroPadValue(x402.to, 20));
-    const periodIdBytes = ethers.toBeHex(BigInt(x402.periodId), 32);
-    const amountBytes = ethers.toBeHex(BigInt(x402.amount), 32);
+    // Get employee info
+    const employeeInfo = await salarySchedule.getEmployee(employee);
+    if (!employeeInfo[3]) {
+      return res.status(404).json({ error: "employee-not-found" });
+    }
 
-    const proof = ethers.concat([
-      employeeBytes,
-      ethers.getBytes(periodIdBytes),
-      ethers.getBytes(amountBytes),
-    ]);
+    const amount = employeeInfo[0].toString();
 
-    const proofHex = ethers.hexlify(proof);
+    // Check if already paid
+    const alreadyPaid = await payrollVault.isPaid(employee, periodId);
+    if (alreadyPaid) {
+      return res.status(200).json({
+        status: "already-paid",
+        employee,
+        periodId,
+      });
+    }
 
-    logger.info("Generated simulator proof", {
-      employee: x402.to,
-      periodId: x402.periodId,
-      amount: x402.amount,
-      proofLength: proof.length,
+    // Call Cronos Facilitator verify endpoint
+    logger.info("Calling facilitator /verify", { employee, periodId });
+
+    const verifyResponse = await axios.post(`${FACILITATOR_URL}/verify`, {
+      x402Version: 1,
+      paymentHeader,
+      paymentRequirements: {
+        scheme: "exact",
+        network: NETWORK_ID,
+        maxAmountRequired: amount,
+        payTo: PAYROLL_VAULT_ADDRESS,
+        asset: USDC_ADDRESS,
+      },
+    });
+
+    if (!verifyResponse.data.verified) {
+      logger.warn("Facilitator verification failed", verifyResponse.data);
+      return res.status(400).json({
+        error: "verification-failed",
+        reason: verifyResponse.data.error || "Unknown error",
+      });
+    }
+
+    // Record payment on-chain
+    const tx = await payrollVault.recordPayment(employee, periodId, amount);
+    const receipt = await tx.wait();
+
+    logger.info("Payment verified and recorded", {
+      employee,
+      periodId,
+      recordTxHash: receipt.hash,
+      settlementTxHash: verifyResponse.data.txHash,
     });
 
     return res.status(200).json({
-      success: true,
-      proof: proofHex,
-      employee: x402.to,
-      periodId: x402.periodId,
-      amount: x402.amount,
+      status: "success",
+      verified: true,
+      recordTxHash: receipt.hash,
+      settlementTxHash: verifyResponse.data.txHash,
     });
-  } catch (err) {
-    logger.error("Error in /simulate-facilitator", {
-      error: (err as Error).message,
+  } catch (err: any) {
+    logger.error("Verification error", {
+      error: err.message,
+      response: err.response?.data,
     });
     return res.status(500).json({
-      error: "internal_error",
-      reason: (err as Error).message,
+      error: "internal-error",
+      message: err.message,
     });
   }
 });
 
 /* ===========================
-   Health & readiness endpoints
+   Admin Endpoints
    =========================== */
+
+/**
+ * POST /admin/deposit
+ *
+ * Employer deposits funds for a payroll period
+ */
+app.post("/admin/deposit", async (req: Request, res: Response) => {
+  const { periodId, amount } = req.body;
+
+  if (!periodId || !amount) {
+    return res.status(400).json({
+      error: "missing-fields",
+      required: ["periodId", "amount"],
+    });
+  }
+
+  try {
+    const amountBn = ethers.parseUnits(String(amount), 6); // Assuming 6 decimals
+
+    // Check allowance
+    const ownerAddress = await signer.getAddress();
+    const allowance = await usdcToken.allowance(
+      ownerAddress,
+      PAYROLL_VAULT_ADDRESS
+    );
+
+    if (BigInt(allowance.toString()) < BigInt(amountBn.toString())) {
+      logger.info("Approving USDC", { amount: amount.toString() });
+      const approveTx = await usdcToken.approve(
+        PAYROLL_VAULT_ADDRESS,
+        amountBn
+      );
+      await approveTx.wait();
+    }
+
+    // Deposit
+    logger.info("Depositing payroll", { periodId, amount: amount.toString() });
+    const depositTx = await payrollVault.depositPayroll(periodId, amountBn);
+    const receipt = await depositTx.wait();
+
+    logger.info("Deposit successful", {
+      periodId,
+      amount: amount.toString(),
+      txHash: receipt.hash,
+    });
+
+    return res.status(200).json({
+      status: "success",
+      txHash: receipt.hash,
+      periodId,
+      amount: amount.toString(),
+    });
+  } catch (err: any) {
+    logger.error("Deposit error", { error: err.message });
+    return res.status(500).json({
+      error: "internal-error",
+      message: err.message,
+    });
+  }
+});
+
+/**
+ * GET /admin/employee/:address
+ *
+ * Get employee details and payment status
+ */
+app.get("/admin/employee/:address", async (req: Request, res: Response) => {
+  const { address } = req.params;
+
+  if (!ethers.isAddress(address)) {
+    return res.status(400).json({ error: "invalid-address" });
+  }
+
+  try {
+    const info = await salarySchedule.getEmployee(address);
+    const [salary, cadence, lastPaid, exists] = info;
+
+    if (!exists) {
+      return res.status(404).json({ error: "employee-not-found" });
+    }
+
+    const nextPeriod = await salarySchedule.nextExpectedPeriod(address);
+    const nextPeriodId = Number(nextPeriod.toString());
+    const isPaid = await payrollVault.isPaid(address, nextPeriodId);
+
+    const cadenceNames = ["Hourly", "Biweekly", "Monthly"];
+
+    return res.status(200).json({
+      employee: address,
+      salary: salary.toString(),
+      salaryFormatted: formatAmount(salary.toString()),
+      cadence: cadenceNames[cadence],
+      lastPaid: Number(lastPaid.toString()),
+      nextPeriod: nextPeriodId,
+      nextPeriodDate: new Date(nextPeriodId * 1000).toISOString(),
+      isPaid,
+      exists,
+    });
+  } catch (err: any) {
+    logger.error("Error fetching employee", { error: err.message });
+    return res.status(500).json({ error: "internal-error" });
+  }
+});
+
+/**
+ * GET /admin/payment-status/:employee/:periodId
+ *
+ * Check payment status for specific employee and period
+ */
+app.get(
+  "/admin/payment-status/:employee/:periodId",
+  async (req: Request, res: Response) => {
+    const { employee, periodId } = req.params;
+
+    if (!ethers.isAddress(employee)) {
+      return res.status(400).json({ error: "invalid-address" });
+    }
+
+    try {
+      const isPaid = await payrollVault.isPaid(employee, periodId);
+      const paymentKey = getPaymentKey(employee, periodId);
+      const localRecord = processedPayments.get(paymentKey);
+
+      return res.status(200).json({
+        employee,
+        periodId,
+        isPaid,
+        recordedLocally: !!localRecord,
+        localRecord: localRecord || null,
+      });
+    } catch (err: any) {
+      logger.error("Error checking payment status", { error: err.message });
+      return res.status(500).json({ error: "internal-error" });
+    }
+  }
+);
+
+/* ===========================
+   Health & Info Endpoints
+   =========================== */
+
 app.get("/healthz", (_req: Request, res: Response) => {
-  res.json({ status: "ok", timestamp: Date.now() });
+  res.json({
+    status: "ok",
+    timestamp: Date.now(),
+    service: "BlockWage Backend",
+    version: "2.0.0-cronos-facilitator",
+  });
+});
+
+app.get("/info", async (_req: Request, res: Response) => {
+  try {
+    const blockNumber = await provider.getBlockNumber();
+    const network = await provider.getNetwork();
+
+    res.json({
+      service: "BlockWage Backend with Cronos x402 Facilitator",
+      contracts: {
+        salarySchedule: SALARY_SCHEDULE_ADDRESS,
+        payrollVault: PAYROLL_VAULT_ADDRESS,
+        usdc: USDC_ADDRESS,
+      },
+      network: {
+        chainId: network.chainId.toString(),
+        caip2: NETWORK_ID,
+        blockNumber,
+      },
+      facilitator: FACILITATOR_URL,
+      features: [
+        "x402 Payment Required responses",
+        "Cronos Facilitator integration",
+        "EIP-3009 gasless payments",
+        "Webhook support",
+        "Manual verification fallback",
+      ],
+    });
+  } catch (err: any) {
+    logger.error("Error in /info", { error: err.message });
+    res.status(500).json({ error: "internal-error" });
+  }
 });
 
 /* ===========================
-   Error handler
+   Error Handler
    =========================== */
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-  logger.error("Unhandled error", { err: err?.stack ?? err });
-  res.status(500).json({ error: "internal_server_error" });
+  logger.error("Unhandled error", {
+    error: err.message,
+    stack: err.stack,
+  });
+  res.status(500).json({
+    error: "internal-server-error",
+    message: "An unexpected error occurred",
+  });
 });
 
 /* ===========================
-   Start server
+   Start Server
    =========================== */
 app.listen(PORT, () => {
-  logger.info(`BlockWage backend listening on port ${PORT}`);
+  logger.info(`🚀 BlockWage Backend started on port ${PORT}`);
+  logger.info(`📡 Network: ${NETWORK_ID}`);
+  logger.info(`🏦 Facilitator: ${FACILITATOR_URL}`);
+  logger.info(`📋 Contracts:`);
+  logger.info(`   - SalarySchedule: ${SALARY_SCHEDULE_ADDRESS}`);
+  logger.info(`   - PayrollVault: ${PAYROLL_VAULT_ADDRESS}`);
+  logger.info(`   - USDC: ${USDC_ADDRESS}`);
   logger.info(
-    `Configured contracts: SalarySchedule=${SALARY_SCHEDULE_ADDRESS} PaymentVerifier=${PAYMENT_VERIFIER_ADDRESS} PayrollVault=${PAYROLL_VAULT_ADDRESS}`
+    `✅ Ready to process salary payments via Cronos x402 Facilitator`
   );
 });

@@ -47,13 +47,13 @@ import { useLogger } from "../lib/logger";
 
 type EmployeeInfo = {
   salary: string;
-  cadence: number;
+  cadence: number; // 0 - 3
   lastPaid: number;
   exists: boolean;
 };
 
 const DEFAULT_BACKEND =
-  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3000";
+  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3001";
 
 /* Small helpers */
 const short = (addr?: string) =>
@@ -90,7 +90,7 @@ export default function Dashboard() {
   // Form state: assign employee
   const [assignAddr, setAssignAddr] = useState("");
   const [assignSalary, setAssignSalary] = useState("1"); // human units
-  const [assignCadence, setAssignCadence] = useState<number>(2); // 0 hourly,1 biweekly,2 monthly
+  const [assignCadence, setAssignCadence] = useState<number>(3); // 0 minute, 1 hourly, 2 biweekly, 3 monthly
   const [assignLastPaid, setAssignLastPaid] = useState<number>(0);
   const [assignErrors, setAssignErrors] = useState<Record<string, string>>({});
 
@@ -298,8 +298,10 @@ export default function Dashboard() {
         }
         if (!SALARY_SCHEDULE_ADDRESS)
           throw new Error("SalarySchedule contract address not configured.");
+
         const signer = await (wallet as any).provider.getSigner();
         const schedule = getSalaryScheduleContract(signer);
+
         const amt = await parseTokenAmount(
           assignSalary,
           STABLECOIN_ADDRESS,
@@ -622,79 +624,6 @@ export default function Dashboard() {
     [lookupAddress, getReadProvider, addLog]
   );
 
-  const buildX402Body = useCallback(
-    (addr: string) => {
-      if (!employeeInfo) return null;
-      return {
-        to: addr,
-        amount: employeeInfo.salary,
-        token: STABLECOIN_ADDRESS,
-        periodId: nextPeriod ?? Math.floor(Date.now() / 1000),
-        meta: {
-          cadence: employeeInfo.cadence,
-          lastPaid: employeeInfo.lastPaid,
-        },
-      };
-    },
-    [employeeInfo, nextPeriod]
-  );
-
-  const simulateFacilitatorForClaim = useCallback(
-    async (addr: string) => {
-      addLog({
-        level: "debug",
-        action: "SimulateFacilitator_clicked",
-        message: "clicked simulate",
-        meta: { addr },
-      });
-      if (!addr) {
-        showAlert("error", "Employee address required for simulation.");
-        return null;
-      }
-      const x402 = buildX402Body(addr);
-      if (!x402) {
-        showAlert(
-          "error",
-          "No x402 payload available. Fetch employee info first."
-        );
-        return null;
-      }
-      setStatus("Simulating facilitator payment...");
-      try {
-        const backend = process.env.NEXT_PUBLIC_BACKEND_URL || DEFAULT_BACKEND;
-        const url = `${backend.replace(/\/$/, "")}/simulate-facilitator`;
-        const resp = await axios.post(url, { x402 });
-        addLog({
-          level: "info",
-          action: "SimulateFacilitator",
-          message: "simulator returned",
-          meta: resp.data,
-        });
-        showAlert("success", "Simulator proof generated.");
-        return resp.data;
-      } catch (err: any) {
-        addLog({
-          level: "error",
-          action: "SimulateFacilitator_failed",
-          message: err?.message || String(err),
-          meta: err,
-        });
-        showAlert(
-          "error",
-          "Simulator failed: " + (err?.message || "network error")
-        );
-        return null;
-      } finally {
-        setStatus(null);
-      }
-    },
-    [addLog, buildX402Body, showAlert]
-  );
-
-  /* ===========================
-     Render
-     =========================== */
-
   return (
     <>
       <Head>
@@ -789,9 +718,10 @@ export default function Dashboard() {
                     value={assignCadence}
                     onChange={(e) => setAssignCadence(Number(e.target.value))}
                   >
-                    <option value={2}>Monthly</option>
-                    <option value={1}>Biweekly</option>
-                    <option value={0}>Hourly</option>
+                    <option value={3}>Monthly</option>
+                    <option value={2}>Biweekly</option>
+                    <option value={1}>Hourly</option>
+                    <option value={0}>Minute</option>
                   </select>
                   {assignErrors.cadence && (
                     <div className="text-sm text-red-600 mt-1">
@@ -980,20 +910,6 @@ export default function Dashboard() {
             >
               Fetch Employee
             </button>
-            <button
-              className="btn btn-ghost"
-              onClick={() => {
-                addLog({
-                  level: "debug",
-                  action: "SimulateFromLookup_clicked",
-                  message: "click",
-                });
-                simulateFacilitatorForClaim(lookupAddress);
-              }}
-              disabled={!lookupAddress}
-            >
-              Simulate Facilitator
-            </button>
           </div>
 
           {lookupError && (
@@ -1052,6 +968,18 @@ export default function Dashboard() {
                     on-chain release.
                   </p>
                 </div>
+
+                {/* Quick action: open the employee-facing claim page with the address prefilled */}
+                <div className="mt-4">
+                  <a
+                    className="inline-block px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700"
+                    href={`/claim?employee=${encodeURIComponent(
+                      lookupAddress
+                    )}`}
+                  >
+                    Open Claim Page (prefilled)
+                  </a>
+                </div>
               </div>
             </div>
           ) : (
@@ -1060,6 +988,24 @@ export default function Dashboard() {
             </div>
           )}
         </section>
+
+        {employeeInfo && (
+          <div className="mt-4 p-4 bg-blue-50 rounded-lg">
+            <h4 className="font-semibold mb-2">Payment Instructions</h4>
+            <ol className="list-decimal list-inside space-y-2 text-sm">
+              <li>
+                Employee visits:{" "}
+                <code className="bg-white px-2 py-1 rounded">
+                  GET backendUrl/salary/claim/{lookupAddress}
+                </code>
+              </li>
+              <li>Employee receives 402 Payment Required response</li>
+              <li>Employee signs EIP-3009 authorization with wallet</li>
+              <li>Cronos Facilitator executes gasless USDC transfer</li>
+              <li>Backend receives webhook and records payment</li>
+            </ol>
+          </div>
+        )}
 
         {/* Events & logs */}
         <div className="grid md:grid-cols-2 gap-6 mt-6">
